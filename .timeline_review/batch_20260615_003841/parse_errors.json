@@ -1,0 +1,44 @@
+[
+  {
+    "source_file": "app.log",
+    "line_number": 22,
+    "error_type": "timestamp_error",
+    "error_message": "无法识别的时间格式: BADTIMESTAMP",
+    "raw_content": "BADTIMESTAMP ERROR This line has a bad timestamp format"
+  },
+  {
+    "source_file": "app.log",
+    "line_number": 24,
+    "error_type": "timestamp_error",
+    "error_message": "无法识别的时间格式: invalid",
+    "raw_content": "invalid date format INFO Another bad timestamp here"
+  },
+  {
+    "source_file": "alerts.csv",
+    "line_number": 17,
+    "error_type": "timestamp_error",
+    "error_message": "无法识别的时间格式: not-a-date",
+    "raw_content": "{\"timestamp\": \"not-a-date\", \"severity\": \"ERROR\", \"message\": \"Bad date format row\", \"source\": \"test\", \"host\": \"host\"}"
+  },
+  {
+    "source_file": "app.log",
+    "line_number": 22,
+    "error_type": "timestamp_error",
+    "error_message": "无法识别的时间格式: BADTIMESTAMP",
+    "raw_content": "BADTIMESTAMP ERROR This line has a bad timestamp format"
+  },
+  {
+    "source_file": "app.log",
+    "line_number": 24,
+    "error_type": "timestamp_error",
+    "error_message": "无法识别的时间格式: invalid",
+    "raw_content": "invalid date format INFO Another bad timestamp here"
+  },
+  {
+    "source_file": "alerts.csv",
+    "line_number": 17,
+    "error_type": "timestamp_error",
+    "error_message": "无法识别的时间格式: not-a-date",
+    "raw_content": "{\"timestamp\": \"not-a-date\", \"severity\": \"ERROR\", \"message\": \"Bad date format row\", \"source\": \"test\", \"host\": \"host\"}"
+  }
+]

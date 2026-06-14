@@ -1,0 +1,26 @@
+[
+  {
+    "abs_path": "D:\\workSpace\\AI__SPACE\\zzz-00054\\examples\\app.log",
+    "filename": "app.log",
+    "file_hash": "8e65529ebc1427b7e17dbd752f76341316c772b5abe0a052201885a1c35d6e2e",
+    "event_count": 3,
+    "error_count": 2,
+    "imported_at": "2026-06-15T00:44:58.826980"
+  },
+  {
+    "abs_path": "D:\\workSpace\\AI__SPACE\\zzz-00054\\examples\\alerts.csv",
+    "filename": "alerts.csv",
+    "file_hash": "568d5f72af362f3f5ce217223c52a77caf5e1e98351ec63bf01b228082610d66",
+    "event_count": 2,
+    "error_count": 1,
+    "imported_at": "2026-06-15T00:44:58.833912"
+  },
+  {
+    "abs_path": "D:\\workSpace\\AI__SPACE\\zzz-00054\\examples\\notes.json",
+    "filename": "notes.json",
+    "file_hash": "d6a3b918b0a26bab7d1bdbe5165659220670676a21debc0204f0149362b24eaf",
+    "event_count": 2,
+    "error_count": 0,
+    "imported_at": "2026-06-15T00:44:58.839187"
+  }
+]

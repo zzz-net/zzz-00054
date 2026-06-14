@@ -1,0 +1,9 @@
+[
+  {
+    "source_file": "bad_time.log",
+    "line_number": 1,
+    "error_type": "timestamp_error",
+    "error_message": "无法识别的时间格式: not-a-time",
+    "raw_content": "not-a-time ERROR broken timestamp should report line"
+  }
+]
