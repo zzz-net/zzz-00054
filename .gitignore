@@ -19,15 +19,28 @@ coverage/
 # Env and local state
 .env
 .env.*
-*.log
 *.sqlite
 *.db
 *.tmp
 tmp/
 temp/
 
+# Unignore example log files (needed for tests)
+!examples/*.log
+
 # OS / editor
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
+
+# Timeline review - local batch state and generated exports
+.timeline_review/
+
+# Timeline review - generated test/verification reports in examples/
+examples/report.*
+examples/test_*.md
+examples/test_*.csv
+
+# Timeline review - temporary verification scripts (if any user-created)
+# Test scripts in repo: test_label_undo.py, test_full_regression.py (these are NOT ignored)

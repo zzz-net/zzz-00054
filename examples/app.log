@@ -1,0 +1,25 @@
+2026-06-14 09:15:00 INFO Application started successfully, version=2.3.1
+2026-06-14 09:15:30 DEBUG Loading configuration from /etc/app/config.yaml
+2026-06-14 09:16:45 INFO Database connection pool initialized with 20 connections
+2026-06-14 09:30:12 WARNING High memory usage detected: 85%
+2026-06-14 09:32:45 INFO User authentication successful, user_id=10086
+2026-06-14 09:45:30 ERROR Failed to connect to payment gateway, timeout after 30s
+2026-06-14 09:45:31 ERROR Payment service returned 500 Internal Server Error for order #20260614001
+2026-06-14 09:45:35 ERROR Failed to connect to payment gateway, timeout after 30s
+2026-06-14 09:45:40 WARN Retrying payment for order #20260614001, attempt 2
+2026-06-14 09:45:42 ERROR Payment service returned 500 Internal Server Error for order #20260614001
+2026-06-14 09:46:00 CRITICAL Payment processing completely unavailable, affecting 15 pending orders
+2026-06-14 09:46:15 INFO Circuit breaker opened for payment-service
+2026-06-14 09:50:00 WARNING Database query latency increased: avg=850ms
+2026-06-14 09:55:30 INFO SRE team notified via PagerDuty
+2026-06-14 10:05:00 INFO Rolling back payment service to version 2.3.0
+2026-06-14 10:08:45 INFO Payment service v2.3.0 deployment started
+2026-06-14 10:12:30 INFO Payment service v2.3.0 is now healthy
+2026-06-14 10:12:31 INFO Circuit breaker closed for payment-service
+2026-06-14 10:15:00 INFO Payment processing restored, retrying pending orders
+2026-06-14 10:20:45 INFO All pending orders processed successfully
+2026-06-14 10:25:00 INFO System metrics back to normal levels
+BADTIMESTAMP ERROR This line has a bad timestamp format
+2026-06-14 10:30:00 INFO Post-incident cleanup completed
+invalid date format INFO Another bad timestamp here
+2026-06-14 10:35:00 INFO Final verification check passed
