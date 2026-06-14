@@ -170,3 +170,43 @@ class Phase:
             end_time=datetime.fromisoformat(d["end_time"]) if d.get("end_time") else None,
             description=d.get("description", ""),
         )
+
+
+@dataclass
+class LabelHistory:
+    id: str
+    event_id: str
+    operation: str
+    old_status: Optional[EventStatus]
+    new_status: Optional[EventStatus]
+    old_notes: Optional[str]
+    new_notes: Optional[str]
+    config_version: str
+    created_at: datetime
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "event_id": self.event_id,
+            "operation": self.operation,
+            "old_status": self.old_status.value if self.old_status else None,
+            "new_status": self.new_status.value if self.new_status else None,
+            "old_notes": self.old_notes,
+            "new_notes": self.new_notes,
+            "config_version": self.config_version,
+            "created_at": self.created_at.isoformat(),
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "LabelHistory":
+        return cls(
+            id=d["id"],
+            event_id=d["event_id"],
+            operation=d["operation"],
+            old_status=EventStatus(d["old_status"]) if d.get("old_status") else None,
+            new_status=EventStatus(d["new_status"]) if d.get("new_status") else None,
+            old_notes=d.get("old_notes"),
+            new_notes=d.get("new_notes"),
+            config_version=d["config_version"],
+            created_at=datetime.fromisoformat(d["created_at"]),
+        )

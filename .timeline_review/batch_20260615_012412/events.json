@@ -1,0 +1,106 @@
+[
+  {
+    "id": "4d98a281e8e0cb6e",
+    "timestamp": "2026-06-15T10:00:00",
+    "source": "log",
+    "source_file": "review_app.log",
+    "line_number": 1,
+    "severity": "INFO",
+    "message": "checkout service started",
+    "status": "已确认",
+    "notes": "first human review",
+    "raw_events": [
+      {
+        "source": "log",
+        "source_file": "review_app.log",
+        "line_number": 1,
+        "timestamp_raw": "2026-06-15 10:00:00",
+        "message": "checkout service started",
+        "severity_raw": "INFO",
+        "extra": {}
+      }
+    ],
+    "extra": {},
+    "dedup_key": "7e4c6716730474fc",
+    "created_at": "2026-06-15T01:24:13.491572",
+    "updated_at": "2026-06-15T01:24:15.759150"
+  },
+  {
+    "id": "56d58f05ed6b2f19",
+    "timestamp": "2026-06-15T10:01:00",
+    "source": "alert",
+    "source_file": "review_alerts.csv",
+    "line_number": 2,
+    "severity": "CRITICAL",
+    "message": "payment error rate high",
+    "status": "待确认",
+    "notes": "",
+    "raw_events": [
+      {
+        "source": "alert",
+        "source_file": "review_alerts.csv",
+        "line_number": 2,
+        "timestamp_raw": "2026-06-15 10:01:00",
+        "message": "payment error rate high",
+        "severity_raw": "CRITICAL",
+        "extra": {}
+      }
+    ],
+    "extra": {},
+    "dedup_key": "ee14bd9d5c92b273",
+    "created_at": "2026-06-15T01:24:13.495450",
+    "updated_at": "2026-06-15T01:24:13.495450"
+  },
+  {
+    "id": "bf55b4db15298888",
+    "timestamp": "2026-06-15T10:02:00",
+    "source": "log",
+    "source_file": "review_app.log",
+    "line_number": 2,
+    "severity": "ERROR",
+    "message": "payment timeout on order 42",
+    "status": "待确认",
+    "notes": "",
+    "raw_events": [
+      {
+        "source": "log",
+        "source_file": "review_app.log",
+        "line_number": 2,
+        "timestamp_raw": "2026-06-15 10:02:00",
+        "message": "payment timeout on order 42",
+        "severity_raw": "ERROR",
+        "extra": {}
+      }
+    ],
+    "extra": {},
+    "dedup_key": "c3d5aa54d038f8d6",
+    "created_at": "2026-06-15T01:24:13.491572",
+    "updated_at": "2026-06-15T01:24:13.491572"
+  },
+  {
+    "id": "cde52456fba8c00b",
+    "timestamp": "2026-06-15T10:03:00",
+    "source": "note",
+    "source_file": "review_notes.json",
+    "line_number": 1,
+    "severity": "WARNING",
+    "message": "operator saw checkout slowdown",
+    "status": "待确认",
+    "notes": "",
+    "raw_events": [
+      {
+        "source": "note",
+        "source_file": "review_notes.json",
+        "line_number": 1,
+        "timestamp_raw": "2026-06-15 10:03:00",
+        "message": "operator saw checkout slowdown",
+        "severity_raw": "warning",
+        "extra": {}
+      }
+    ],
+    "extra": {},
+    "dedup_key": "02afb1cbd8d33820",
+    "created_at": "2026-06-15T01:24:13.498883",
+    "updated_at": "2026-06-15T01:24:13.498883"
+  }
+]

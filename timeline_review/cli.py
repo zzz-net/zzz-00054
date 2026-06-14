@@ -292,17 +292,18 @@ class CLIApp:
 
         updated = 0
         for eid in event_ids:
-            event = self.store.set_event_status(batch_id, eid, target_status)
+            if args.notes:
+                event = self.store.set_event_status_and_notes(batch_id, eid, target_status, args.notes)
+            else:
+                event = self.store.set_event_status(batch_id, eid, target_status)
             if event:
                 updated += 1
                 icon = STATUS_ICONS.get(target_status, " ")
                 print(f"✅ {icon} {eid[:8]}... -> {target_status.value}")
+                if args.notes:
+                    print(f"   备注: {args.notes}")
             else:
                 print(f"❌ 未找到事件: {eid}")
-
-        if args.notes:
-            for eid in event_ids:
-                self.store.set_event_notes(batch_id, eid, args.notes)
 
         print(f"\n📝 已更新 {updated}/{len(event_ids)} 个事件的状态")
 
@@ -499,6 +500,76 @@ class CLIApp:
                 print(f"     内容: {err.raw_content[:100]}")
             print()
 
+    def cmd_label_history(self, args) -> None:
+        batch_id = self._require_batch()
+        history = self.store.get_label_history(batch_id)
+
+        if not history:
+            print("📭 没有标注历史记录")
+            return
+
+        limit = args.limit or len(history)
+        display = history[-limit:][::-1]
+
+        print(f"📜 标注历史记录 (共 {len(history)} 条，最近 {len(display)} 条):")
+        print()
+        for i, h in enumerate(display, 1):
+            op_desc = {
+                "set_status": "修改状态",
+                "set_notes": "修改备注",
+                "set_both": "修改状态+备注",
+            }.get(h.operation, h.operation)
+            print(f"  [{h.id}] {h.created_at.strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"      操作: {op_desc}  事件ID: {h.event_id[:16]}...")
+            if h.old_status or h.new_status:
+                old_s = h.old_status.value if h.old_status else "无"
+                new_s = h.new_status.value if h.new_status else "无"
+                print(f"      状态: {old_s} -> {new_s}")
+            if h.old_notes is not None or h.new_notes is not None:
+                old_n = (h.old_notes[:30] + "...") if h.old_notes and len(h.old_notes) > 30 else (h.old_notes or "空")
+                new_n = (h.new_notes[:30] + "...") if h.new_notes and len(h.new_notes) > 30 else (h.new_notes or "空")
+                print(f"      备注: {old_n} -> {new_n}")
+            print(f"      规则版本: {h.config_version}")
+            print()
+
+    def cmd_undo_label(self, args) -> None:
+        batch_id = self._require_batch()
+        history = self.store.get_label_history(batch_id)
+
+        if not history:
+            print("ℹ️  没有可撤销的标注记录（与导入撤销是独立的功能）")
+            return
+
+        last = self.store.undo_last_label(batch_id)
+        if not last:
+            print("ℹ️  没有可撤销的标注记录")
+            return
+
+        op_desc = {
+            "set_status": "修改状态",
+            "set_notes": "修改备注",
+            "set_both": "修改状态+备注",
+        }.get(last.operation, last.operation)
+
+        print(f"↩️  已撤销标注操作:")
+        print(f"   操作类型: {op_desc}")
+        print(f"   事件ID:   {last.event_id}")
+        print(f"   操作时间: {last.created_at.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"   规则版本: {last.config_version}")
+
+        if last.operation in ("set_status", "set_both"):
+            old_s = last.old_status.value if last.old_status else "无"
+            new_s = last.new_status.value if last.new_status else "无"
+            print(f"   状态已恢复: {new_s} -> {old_s}")
+
+        if last.operation in ("set_notes", "set_both"):
+            old_n = (last.old_notes[:50] + "...") if last.old_notes and len(last.old_notes) > 50 else (last.old_notes or "空")
+            new_n = (last.new_notes[:50] + "...") if last.new_notes and len(last.new_notes) > 50 else (last.new_notes or "空")
+            print(f"   备注已恢复: {new_n} -> {old_n}")
+
+        remaining = len(self.store.get_label_history(batch_id))
+        print(f"   剩余可撤销次数: {remaining}")
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -516,11 +587,15 @@ def build_parser() -> argparse.ArgumentParser:
   # 3. 查看时间线
   timeline-review timeline --limit 20
 
-  # 4. 标注事件
-  timeline-review label --status root <event_id>
+  # 4. 标注事件（状态和备注可以同时设置）
+  timeline-review label --status root <event_id> --notes "第三方支付接口变更"
   timeline-review label --status noise <event_id1> <event_id2>
 
-  # 5. 导出报告
+  # 5. 查看和撤销标注（与导入撤销是独立功能）
+  timeline-review label-history
+  timeline-review undo-label
+
+  # 6. 导出报告
   timeline-review export --format markdown --output report.md
         """,
     )
@@ -589,6 +664,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_errors = subparsers.add_parser("errors", help="显示解析错误详情")
     p_errors.add_argument("--verbose", "-v", action="store_true", help="显示原始内容")
+
+    p_label_history = subparsers.add_parser("label-history", help="查看标注历史记录")
+    p_label_history.add_argument("--limit", "-n", type=int, help="显示最近的N条记录")
+
+    p_undo_label = subparsers.add_parser("undo-label", help="撤销最后一次标注操作（状态/备注，与导入撤销独立）")
 
     return parser
 

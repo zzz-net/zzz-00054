@@ -5,8 +5,9 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 import copy
 
-from .models import Event, EventStatus, ParseError, Phase
+from .models import Event, EventStatus, ParseError, Phase, LabelHistory
 from .config import RuleConfig
+import uuid
 
 
 STORAGE_DIR_NAME = ".timeline_review"
@@ -56,6 +57,9 @@ class StateStore:
     def _imports_index_path(self, batch_id: str) -> Path:
         return self._get_batch_dir(batch_id) / "imports_index.json"
 
+    def _label_history_path(self, batch_id: str) -> Path:
+        return self._get_batch_dir(batch_id) / "label_history.json"
+
     def _active_batch_path(self) -> Path:
         return self.storage_dir / "active_batch.json"
 
@@ -94,6 +98,7 @@ class StateStore:
         self.save_events(batch_id, [])
         self.save_parse_errors(batch_id, [])
         self._write_imports_index(batch_id, [])
+        self._write_label_history(batch_id, [])
         self._set_active_batch(batch_id)
         return meta
 
@@ -189,11 +194,98 @@ class StateStore:
             self.save_events(batch_id, events)
         return updated
 
+    def _read_label_history(self, batch_id: str) -> List[LabelHistory]:
+        path = self._label_history_path(batch_id)
+        if not path.exists():
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return [LabelHistory.from_dict(d) for d in data]
+        except (json.JSONDecodeError, IOError):
+            return []
+
+    def _write_label_history(self, batch_id: str, history: List[LabelHistory]) -> None:
+        self._ensure_batch_dir(batch_id)
+        data = [h.to_dict() for h in history]
+        with open(self._label_history_path(batch_id), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def _record_label_change(self, batch_id: str, event_id: str, operation: str,
+                             old_status: Optional[EventStatus] = None,
+                             new_status: Optional[EventStatus] = None,
+                             old_notes: Optional[str] = None,
+                             new_notes: Optional[str] = None) -> None:
+        config = self.load_config(batch_id)
+        history_entry = LabelHistory(
+            id=str(uuid.uuid4())[:8],
+            event_id=event_id,
+            operation=operation,
+            old_status=old_status,
+            new_status=new_status,
+            old_notes=old_notes,
+            new_notes=new_notes,
+            config_version=config.rule_version,
+            created_at=datetime.now(),
+        )
+        history = self._read_label_history(batch_id)
+        history.append(history_entry)
+        self._write_label_history(batch_id, history)
+
+    def get_label_history(self, batch_id: str) -> List[LabelHistory]:
+        return self._read_label_history(batch_id)
+
     def set_event_status(self, batch_id: str, event_id: str, status: EventStatus) -> Optional[Event]:
-        return self.update_event(batch_id, event_id, status=status)
+        old_event = self.get_event_by_id(batch_id, event_id)
+        old_status = old_event.status if old_event else None
+        updated = self.update_event(batch_id, event_id, status=status)
+        if updated and old_status != status:
+            self._record_label_change(
+                batch_id, event_id, "set_status",
+                old_status=old_status, new_status=status
+            )
+        return updated
 
     def set_event_notes(self, batch_id: str, event_id: str, notes: str) -> Optional[Event]:
-        return self.update_event(batch_id, event_id, notes=notes)
+        old_event = self.get_event_by_id(batch_id, event_id)
+        old_notes = old_event.notes if old_event else None
+        updated = self.update_event(batch_id, event_id, notes=notes)
+        if updated and old_notes != notes:
+            self._record_label_change(
+                batch_id, event_id, "set_notes",
+                old_notes=old_notes, new_notes=notes
+            )
+        return updated
+
+    def set_event_status_and_notes(self, batch_id: str, event_id: str,
+                                    status: EventStatus, notes: str) -> Optional[Event]:
+        old_event = self.get_event_by_id(batch_id, event_id)
+        old_status = old_event.status if old_event else None
+        old_notes = old_event.notes if old_event else None
+        updated = self.update_event(batch_id, event_id, status=status, notes=notes)
+        if updated:
+            if old_status != status or old_notes != notes:
+                self._record_label_change(
+                    batch_id, event_id, "set_both",
+                    old_status=old_status, new_status=status,
+                    old_notes=old_notes, new_notes=notes
+                )
+        return updated
+
+    def undo_last_label(self, batch_id: str) -> Optional[LabelHistory]:
+        history = self._read_label_history(batch_id)
+        if not history:
+            return None
+        last = history.pop()
+        updates = {}
+        if last.operation in ("set_status", "set_both") and last.old_status is not None:
+            updates["status"] = last.old_status
+        if last.operation in ("set_notes", "set_both") and last.old_notes is not None:
+            updates["notes"] = last.old_notes
+        if updates:
+            self.update_event(batch_id, last.event_id, **updates)
+        self._write_label_history(batch_id, history)
+        return last
 
     def save_parse_errors(self, batch_id: str, errors: List[ParseError]) -> None:
         self._ensure_batch_dir(batch_id)
