@@ -60,6 +60,9 @@ class StateStore:
     def _label_history_path(self, batch_id: str) -> Path:
         return self._get_batch_dir(batch_id) / "label_history.json"
 
+    def _overview_snapshot_path(self, batch_id: str) -> Path:
+        return self._get_batch_dir(batch_id) / "overview_snapshot.json"
+
     def _active_batch_path(self) -> Path:
         return self.storage_dir / "active_batch.json"
 
@@ -100,6 +103,7 @@ class StateStore:
         self._write_imports_index(batch_id, [])
         self._write_label_history(batch_id, [])
         self._set_active_batch(batch_id)
+        self.refresh_overview_snapshot(batch_id)
         return meta
 
     def get_batch_meta(self, batch_id: str) -> Dict:
@@ -147,6 +151,10 @@ class StateStore:
         self._ensure_batch_dir(batch_id)
         with open(self._config_path(batch_id), "w", encoding="utf-8") as f:
             json.dump(config.to_dict(), f, ensure_ascii=False, indent=2)
+        try:
+            self.refresh_overview_snapshot(batch_id)
+        except Exception:
+            pass
 
     def load_config(self, batch_id: str) -> RuleConfig:
         path = self._config_path(batch_id)
@@ -162,6 +170,10 @@ class StateStore:
         with open(self._events_path(batch_id), "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         self.update_batch_meta(batch_id, event_count=len(events))
+        try:
+            self.refresh_overview_snapshot(batch_id)
+        except Exception:
+            pass
 
     def load_events(self, batch_id: str) -> List[Event]:
         path = self._events_path(batch_id)
@@ -231,6 +243,10 @@ class StateStore:
         history = self._read_label_history(batch_id)
         history.append(history_entry)
         self._write_label_history(batch_id, history)
+        try:
+            self.refresh_overview_snapshot(batch_id)
+        except Exception:
+            pass
 
     def get_label_history(self, batch_id: str) -> List[LabelHistory]:
         return self._read_label_history(batch_id)
@@ -285,6 +301,10 @@ class StateStore:
         if updates:
             self.update_event(batch_id, last.event_id, **updates)
         self._write_label_history(batch_id, history)
+        try:
+            self.refresh_overview_snapshot(batch_id)
+        except Exception:
+            pass
         return last
 
     def save_parse_errors(self, batch_id: str, errors: List[ParseError]) -> None:
@@ -292,6 +312,10 @@ class StateStore:
         data = [e.to_dict() for e in errors]
         with open(self._parse_errors_path(batch_id), "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
+        try:
+            self.refresh_overview_snapshot(batch_id)
+        except Exception:
+            pass
 
     def load_parse_errors(self, batch_id: str) -> List[ParseError]:
         path = self._parse_errors_path(batch_id)
@@ -350,6 +374,10 @@ class StateStore:
         index = self._read_imports_index(batch_id)
         index.append(entry)
         self._write_imports_index(batch_id, index)
+        try:
+            self.refresh_overview_snapshot(batch_id)
+        except Exception:
+            pass
         return entry
 
     def undo_last_import(self, batch_id: str) -> Optional[Dict]:
@@ -358,7 +386,187 @@ class StateStore:
             return None
         last = index.pop()
         self._write_imports_index(batch_id, index)
+        try:
+            self.refresh_overview_snapshot(batch_id)
+        except Exception:
+            pass
         return last
+
+    def _infer_source_type(self, filename: str) -> str:
+        ext = Path(filename).suffix.lower()
+        if ext == ".csv":
+            return "告警(CSV)"
+        elif ext == ".json":
+            return "备注(JSON)"
+        else:
+            return "日志(LOG)"
+
+    def refresh_overview_snapshot(self, batch_id: str) -> Dict:
+        snapshot = {
+            "snapshot_version": 1,
+            "updated_at": datetime.now().isoformat(),
+        }
+        try:
+            meta = self.get_batch_meta(batch_id)
+            snapshot["batch_id"] = meta.get("id", batch_id)
+            snapshot["batch_name"] = meta.get("name", "未知批次")
+            snapshot["description"] = meta.get("description", "")
+            snapshot["created_at"] = meta.get("created_at", "")
+            snapshot["batch_updated_at"] = meta.get("updated_at", "")
+        except (BatchNotFoundError, json.JSONDecodeError, IOError) as e:
+            snapshot["batch_id"] = batch_id
+            snapshot["batch_name"] = "批次元数据缺失"
+            snapshot["description"] = f"警告: 无法读取批次元数据 ({e})"
+            snapshot["created_at"] = ""
+            snapshot["batch_updated_at"] = ""
+            snapshot["_meta_error"] = str(e)
+
+        try:
+            events = self.load_events(batch_id)
+            snapshot["event_count"] = len(events)
+            by_status: Dict[str, int] = {}
+            by_severity: Dict[str, int] = {}
+            by_source: Dict[str, int] = {}
+            for e in events:
+                s = e.status.value
+                by_status[s] = by_status.get(s, 0) + 1
+                sev = e.severity.value
+                by_severity[sev] = by_severity.get(sev, 0) + 1
+                src = e.source.value
+                by_source[src] = by_source.get(src, 0) + 1
+            snapshot["events_by_status"] = by_status
+            snapshot["events_by_severity"] = by_severity
+            snapshot["events_by_source"] = by_source
+            if events:
+                sorted_events = sorted(events, key=lambda e: e.timestamp)
+                snapshot["time_range_start"] = sorted_events[0].timestamp.isoformat()
+                snapshot["time_range_end"] = sorted_events[-1].timestamp.isoformat()
+            else:
+                snapshot["time_range_start"] = None
+                snapshot["time_range_end"] = None
+        except Exception as e:
+            snapshot["event_count"] = 0
+            snapshot["events_by_status"] = {}
+            snapshot["events_by_severity"] = {}
+            snapshot["events_by_source"] = {}
+            snapshot["time_range_start"] = None
+            snapshot["time_range_end"] = None
+            snapshot["_events_error"] = str(e)
+
+        try:
+            errors = self.load_parse_errors(batch_id)
+            snapshot["parse_error_count"] = len(errors)
+            error_by_file: Dict[str, int] = {}
+            for err in errors:
+                error_by_file[err.source_file] = error_by_file.get(err.source_file, 0) + 1
+            snapshot["parse_errors_by_file"] = error_by_file
+        except Exception as e:
+            snapshot["parse_error_count"] = 0
+            snapshot["parse_errors_by_file"] = {}
+            snapshot["_parse_errors_error"] = str(e)
+
+        try:
+            imported = self.get_imported_files(batch_id)
+            imported_files = []
+            for f in imported:
+                imported_files.append({
+                    "filename": f.get("filename", "未知文件"),
+                    "abs_path": f.get("abs_path", ""),
+                    "source_type": self._infer_source_type(f.get("filename", "")),
+                    "event_count": f.get("event_count", 0),
+                    "error_count": f.get("error_count", 0),
+                    "file_hash": f.get("file_hash", "")[:16] if f.get("file_hash") else "",
+                    "imported_at": f.get("imported_at", ""),
+                })
+            snapshot["imported_files"] = imported_files
+            snapshot["imported_file_count"] = len(imported_files)
+        except Exception as e:
+            snapshot["imported_files"] = []
+            snapshot["imported_file_count"] = 0
+            snapshot["_imports_error"] = str(e)
+
+        try:
+            config = self.load_config(batch_id)
+            snapshot["rule_version"] = config.rule_version
+            snapshot["dedup_window_seconds"] = config.dedup_window_seconds
+            snapshot["gap_threshold_seconds"] = config.gap_threshold_seconds
+            snapshot["dedup_similarity_threshold"] = config.dedup_similarity_threshold
+            snapshot["phase_count"] = len(config.phases)
+        except Exception as e:
+            snapshot["rule_version"] = "未知"
+            snapshot["dedup_window_seconds"] = 0
+            snapshot["gap_threshold_seconds"] = 0
+            snapshot["dedup_similarity_threshold"] = 0.0
+            snapshot["phase_count"] = 0
+            snapshot["_config_error"] = str(e)
+
+        try:
+            exports = self.get_exports(batch_id)
+            snapshot["export_count"] = len(exports)
+            if exports:
+                last = exports[0]
+                snapshot["last_export"] = {
+                    "filename": last.get("filename", ""),
+                    "path": last.get("path", ""),
+                    "size": last.get("size", 0),
+                    "exported_at": last.get("modified_at", ""),
+                }
+            else:
+                snapshot["last_export"] = None
+        except Exception as e:
+            snapshot["export_count"] = 0
+            snapshot["last_export"] = None
+            snapshot["_exports_error"] = str(e)
+
+        try:
+            history = self.get_label_history(batch_id)
+            snapshot["label_action_count"] = len(history)
+            if history:
+                last = history[-1]
+                op_desc = {
+                    "set_status": "修改状态",
+                    "set_notes": "修改备注",
+                    "set_both": "修改状态+备注",
+                }.get(last.operation, last.operation)
+                snapshot["last_label_action"] = {
+                    "operation": op_desc,
+                    "operation_raw": last.operation,
+                    "event_id": last.event_id,
+                    "event_id_short": last.event_id[:12] + "..." if len(last.event_id) > 12 else last.event_id,
+                    "old_status": last.old_status.value if last.old_status else None,
+                    "new_status": last.new_status.value if last.new_status else None,
+                    "old_notes_preview": (last.old_notes[:40] + "...") if last.old_notes and len(last.old_notes) > 40 else (last.old_notes or ""),
+                    "new_notes_preview": (last.new_notes[:40] + "...") if last.new_notes and len(last.new_notes) > 40 else (last.new_notes or ""),
+                    "config_version": last.config_version,
+                    "acted_at": last.created_at.isoformat(),
+                }
+            else:
+                snapshot["last_label_action"] = None
+        except Exception as e:
+            snapshot["label_action_count"] = 0
+            snapshot["last_label_action"] = None
+            snapshot["_label_history_error"] = str(e)
+
+        try:
+            self._ensure_batch_dir(batch_id)
+            with open(self._overview_snapshot_path(batch_id), "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            snapshot["_write_error"] = str(e)
+
+        return snapshot
+
+    def load_overview_snapshot(self, batch_id: str, auto_refresh: bool = True) -> Dict:
+        path = self._overview_snapshot_path(batch_id)
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                pass
+        if auto_refresh:
+            return self.refresh_overview_snapshot(batch_id)
+        return {}
 
     def save_export(self, batch_id: str, export_type: str, content: str, filename: str) -> str:
         batch_dir = self._ensure_batch_dir(batch_id)
@@ -370,6 +578,10 @@ class StateStore:
         export_path = exports_dir / export_filename
         with open(export_path, "w", encoding="utf-8") as f:
             f.write(content)
+        try:
+            self.refresh_overview_snapshot(batch_id)
+        except Exception:
+            pass
         return str(export_path)
 
     def get_exports(self, batch_id: str) -> List[Dict]:

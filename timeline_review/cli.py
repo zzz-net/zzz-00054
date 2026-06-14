@@ -116,6 +116,174 @@ class CLIApp:
         print(f"⚙️  规则版本: {config.rule_version}")
         print(f"   去重窗口: {config.dedup_window_seconds}s  缺口阈值: {config.gap_threshold_seconds}s")
 
+    def cmd_overview(self, args) -> None:
+        batch_id = self.store.get_active_batch()
+        if not batch_id:
+            print("📭 没有活动批次")
+            print("   提示: 使用 'create' 创建批次，或 'switch' 切换到已有批次")
+            return
+
+        try:
+            snapshot = self.store.load_overview_snapshot(batch_id)
+        except Exception as e:
+            print(f"⚠️  概览数据加载失败，正在重建: {e}")
+            snapshot = self.store.refresh_overview_snapshot(batch_id)
+
+        if not snapshot:
+            print("⚠️  无法获取批次概览，批次目录可能已损坏")
+            return
+
+        warnings = []
+        for key in ["_meta_error", "_events_error", "_parse_errors_error",
+                    "_imports_error", "_config_error", "_exports_error",
+                    "_label_history_error", "_write_error"]:
+            if key in snapshot:
+                warnings.append(f"   ⚠️  {key[1:]}: {snapshot[key]}")
+
+        print("=" * 62)
+        batch_name = snapshot.get("batch_name", "未知批次")
+        batch_id_display = snapshot.get("batch_id", batch_id)
+        print(f"📋 批次概览: {batch_name}")
+        print(f"   批次 ID:  {batch_id_display}")
+        if snapshot.get("description"):
+            print(f"   描    述: {snapshot['description']}")
+        if snapshot.get("created_at"):
+            print(f"   创建时间: {snapshot['created_at']}")
+        updated = snapshot.get("updated_at", "")
+        if updated:
+            print(f"   概览刷新: {updated}")
+        print("=" * 62)
+
+        print()
+        print("📁 已导入数据:")
+        imported_files = snapshot.get("imported_files", [])
+        imported_count = snapshot.get("imported_file_count", len(imported_files))
+        if imported_count == 0 or not imported_files:
+            print("   (暂无已导入文件，使用 'import' 命令导入数据)")
+        else:
+            for i, f in enumerate(imported_files, 1):
+                fname = f.get("filename", "未知文件")
+                stype = f.get("source_type", "未知类型")
+                ec = f.get("event_count", 0)
+                errc = f.get("error_count", 0)
+                ts = f.get("imported_at", "")
+                hash_short = f.get("file_hash", "")
+                line = f"   {i:>2}. [{stype:<10}] {fname}"
+                if ec or errc:
+                    line += f"  ({ec} 事件"
+                    if errc > 0:
+                        line += f", {errc} 错误"
+                    line += ")"
+                print(line)
+                if ts:
+                    print(f"       导入时间: {ts}")
+                if hash_short:
+                    print(f"       文件哈希: {hash_short}...")
+
+        print()
+        print("📊 数据统计:")
+        event_count = snapshot.get("event_count", 0)
+        parse_error_count = snapshot.get("parse_error_count", 0)
+        src_label = {"log": "日志", "alert": "告警", "note": "备注"}
+        by_source = snapshot.get("events_by_source", {})
+        source_parts = []
+        for k, v in by_source.items():
+            source_parts.append(f"{src_label.get(k, k)} {v}")
+        source_str = "  ".join(source_parts) if source_parts else "无"
+        print(f"   事件总数:     {event_count}  ({source_str})")
+
+        by_status = snapshot.get("events_by_status", {})
+        if by_status:
+            status_parts = [f"{k} {v}" for k, v in by_status.items()]
+            print(f"   状态分布:     {'  '.join(status_parts)}")
+
+        by_severity = snapshot.get("events_by_severity", {})
+        if by_severity:
+            sev_parts = [f"{k} {v}" for k, v in sorted(by_severity.items())]
+            print(f"   严重级别:     {'  '.join(sev_parts)}")
+
+        if snapshot.get("time_range_start") and snapshot.get("time_range_end"):
+            ts_start = snapshot["time_range_start"].replace("T", " ")[:19]
+            ts_end = snapshot["time_range_end"].replace("T", " ")[:19]
+            print(f"   时间范围:     {ts_start}  ~  {ts_end}")
+
+        print(f"   解析错误数:   {parse_error_count}")
+        pe_by_file = snapshot.get("parse_errors_by_file", {})
+        if pe_by_file:
+            for fname, cnt in pe_by_file.items():
+                print(f"     - {fname}: {cnt} 个")
+
+        print()
+        print("🏷️  最近标注动作:")
+        last_label = snapshot.get("last_label_action")
+        label_count = snapshot.get("label_action_count", 0)
+        if not last_label:
+            if label_count == 0:
+                print("   (暂无标注记录)")
+            else:
+                print(f"   (历史标注 {label_count} 次，最近记录已被撤销)")
+        else:
+            op = last_label.get("operation", "未知操作")
+            eid_short = last_label.get("event_id_short", "???")
+            acted_at = last_label.get("acted_at", "")
+            print(f"   操作:   {op}")
+            print(f"   事件:   {eid_short}")
+            if last_label.get("old_status") or last_label.get("new_status"):
+                old_s = last_label.get("old_status") or "无"
+                new_s = last_label.get("new_status") or "无"
+                print(f"   状态:   {old_s}  →  {new_s}")
+            if last_label.get("old_notes_preview") is not None or last_label.get("new_notes_preview") is not None:
+                old_n = last_label.get("old_notes_preview") or "(空)"
+                new_n = last_label.get("new_notes_preview") or "(空)"
+                print(f"   备注:   {old_n}  →  {new_n}")
+            if last_label.get("config_version"):
+                print(f"   规则版本: {last_label['config_version']}")
+            if acted_at:
+                print(f"   操作时间: {acted_at}")
+            if label_count > 1:
+                print(f"   (共 {label_count} 次标注操作记录)")
+
+        print()
+        print("📤 最近导出:")
+        last_export = snapshot.get("last_export")
+        export_count = snapshot.get("export_count", 0)
+        if not last_export:
+            if export_count == 0:
+                print("   (暂无导出记录，使用 'export' 命令导出报告)")
+            else:
+                print(f"   (历史导出 {export_count} 次，最近记录已不可用)")
+        else:
+            fname = last_export.get("filename", "")
+            size = last_export.get("size", 0)
+            ts = last_export.get("exported_at", "")
+            print(f"   文件:     {fname}")
+            print(f"   大小:     {size} 字节")
+            if ts:
+                print(f"   导出时间: {ts}")
+            if export_count > 1:
+                print(f"   (共 {export_count} 次历史导出)")
+
+        print()
+        print("⚙️  当前规则配置:")
+        rule_ver = snapshot.get("rule_version", "未知")
+        dedup_win = snapshot.get("dedup_window_seconds", 0)
+        gap_thr = snapshot.get("gap_threshold_seconds", 0)
+        sim_thr = snapshot.get("dedup_similarity_threshold", 0)
+        phase_cnt = snapshot.get("phase_count", 0)
+        print(f"   规则版本:       {rule_ver}")
+        print(f"   去重时间窗口:   {dedup_win}s")
+        print(f"   缺口时间阈值:   {gap_thr}s")
+        print(f"   去重相似度:     {sim_thr}")
+        print(f"   已配置阶段数:   {phase_cnt}")
+
+        if warnings:
+            print()
+            print("⚠️  数据完整性警告:")
+            for w in warnings:
+                print(w)
+
+        print()
+
     def cmd_import(self, args) -> None:
         batch_id = self._require_batch()
         config = self.store.load_config(batch_id)
@@ -611,6 +779,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_switch.add_argument("batch_id", help="批次 ID")
 
     p_status = subparsers.add_parser("status", help="显示当前批次状态")
+
+    p_overview = subparsers.add_parser("overview", help="批次概览（一目了然显示进度）")
 
     p_import = subparsers.add_parser("import", help="导入日志/告警/备注文件")
     p_import.add_argument("files", nargs="+", help="要导入的文件路径")
