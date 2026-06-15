@@ -1928,6 +1928,13 @@ class CLIApp:
 
         if verify_result.get("consistent"):
             print("✅ 导出核对通过，数据一致")
+            self.store.log_change(batch_id, "audit_export_with_audit_success", {
+                "output_file": output_path,
+                "format": fmt,
+                "size": len(content),
+                "export_count": verify_result.get("export_count", 0),
+                "actual_valid_count": verify_result.get("actual_valid_count", 0),
+            }, severity="info")
         else:
             print("❌ 导出核对失败!")
             print()
@@ -2026,14 +2033,36 @@ class CLIApp:
         last_result = detail.get("last_processed_result")
         if last_result:
             result_icon = "✅ 成功" if last_result.get("result") == "success" else "❌ 失败"
-            print(f"   动作:               {last_result.get('action', '未知')}")
-            print(f"   结果:               {result_icon}")
-            print(f"   时间:               {last_result.get('timestamp', '')[:19].replace('T', ' ')}")
-            action_details = last_result.get("details", {})
-            if action_details:
-                for k, v in list(action_details.items())[:5]:
-                    if v:
-                        print(f"   {k:<20} {v}")
+            action_display = last_result.get("action_display") or last_result.get("action", "未知")
+            print(f"   动作类型:           {action_display}")
+            print(f"   处理结果:           {result_icon}")
+            print(f"   发生时间:           {last_result.get('timestamp', '')[:19].replace('T', ' ')}")
+            details = last_result.get("details", {})
+            if details:
+                relevant_keys = ["display_index", "import_id", "filename", "removed_events",
+                                 "restored_events", "event_count", "round_number"]
+                printed = 0
+                for k in relevant_keys:
+                    if k in details and details[k]:
+                        label_map = {
+                            "display_index": "显示序号",
+                            "import_id": "导入ID",
+                            "filename": "文件名",
+                            "removed_events": "删除事件数",
+                            "restored_events": "恢复事件数",
+                            "event_count": "涉及记录数",
+                            "round_number": "导入轮次",
+                        }
+                        label = label_map.get(k, k)
+                        v = details[k]
+                        if k == "import_id" and isinstance(v, str) and len(v) > 16:
+                            v = v[:16] + "..."
+                        print(f"   {label:<18} {v}")
+                        printed += 1
+                if printed == 0:
+                    for k, v in list(details.items())[:3]:
+                        if v:
+                            print(f"   {k:<18} {v}")
         else:
             print("   (暂无处理结果记录)")
         print()

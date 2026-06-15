@@ -811,26 +811,51 @@ class StateStore:
                 sev_val = e.severity.value
                 event_stats["by_severity"][sev_val] = event_stats["by_severity"].get(sev_val, 0) + 1
 
-        change_log = self.get_change_log(batch_id, limit=10, change_type="import_change")
-        related_logs = [
-            log for log in change_log
-            if log.get("detail", {}).get("import_id") == import_id
-            or log.get("detail", {}).get("filename") == detail.get("filename")
-        ]
+        change_log = self.get_change_log(batch_id, limit=50)
+        related_logs = []
+        for log in change_log:
+            log_detail = log.get("detail", {})
+            if (log_detail.get("import_id") == import_id
+                    or log_detail.get("filename") == detail.get("filename")
+                    or log_detail.get("display_index") == display_index):
+                related_logs.append(log)
 
         last_processed_result = None
         if related_logs:
             last_log = related_logs[0]
+            action_type_map = {
+                "import_registered": "导入",
+                "import_attached_to_events": "导入",
+                "undo_import_completed": "撤销",
+                "restore_import_completed": "恢复",
+                "audit_undo_import_success": "撤销",
+                "audit_restore_import_success": "恢复",
+                "audit_undo_invalid_status": "撤销(失败)",
+                "audit_restore_invalid_status": "恢复(失败)",
+                "audit_restore_conflict_blocked": "恢复(冲突)",
+                "audit_undo_conflict_warning": "撤销(警告)",
+                "audit_export_with_audit_success": "导出核对",
+                "audit_export_with_audit_failed": "导出核对(失败)",
+            }
+            raw_action = last_log.get("change_type", "")
+            action_display = action_type_map.get(raw_action, raw_action)
             last_processed_result = {
-                "action": last_log.get("change_type", ""),
+                "action": raw_action,
+                "action_display": action_display,
                 "result": "success" if last_log.get("severity") != "error" else "failed",
                 "timestamp": last_log.get("created_at", ""),
                 "details": last_log.get("detail", {}),
             }
 
+        operation_type = self._get_operation_type(
+            detail.get("status", "unknown"),
+            detail
+        )
+
         return {
             **detail,
             "display_index": display_index,
+            "operation_type": operation_type,
             "event_stats": event_stats,
             "source_file": detail.get("abs_path", ""),
             "last_processed_result": last_processed_result,
