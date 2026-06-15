@@ -747,6 +747,11 @@ class CLIApp:
                         print(f"   原导入时间: {existing.get('imported_at', 'N/A')}")
                         print(f"   原导入事件: {existing.get('event_count', 0)} 条")
                         print(f"   💡 使用 --force 强制重新导入")
+                    elif recommendation == "restore_or_force":
+                        print(f"⚠️  冲突: 文件存在已撤销的导入记录: {path.name}")
+                        print(f"   原导入时间: {existing.get('imported_at', 'N/A')}")
+                        print(f"   原导入事件: {existing.get('event_count', 0)} 条")
+                        print(f"   💡 使用 restore-import 恢复该导入，或 --force 强制重新导入")
                     else:
                         print(f"⏭️  文件已导入过，跳过: {path.name}")
                         print(f"   导入时间: {existing.get('imported_at', 'N/A')}")
@@ -897,9 +902,20 @@ class CLIApp:
         batch_id = self._require_batch()
         target_round = getattr(args, "round", None)
         target_import_id = getattr(args, "import_id", None)
+        target_index = getattr(args, "index", None)
+
+        if target_index is not None:
+            resolved = self.store.resolve_import_by_display_index(batch_id, target_index)
+            if not resolved:
+                print(f"❌ 序号 {target_index} 对应的导入记录不存在", file=sys.stderr)
+                return
+            target_import_id = resolved.get("import_id")
+            print(f"📍 序号 {target_index} → 导入ID {target_import_id[:16]}...")
 
         undo_desc = ""
-        if target_round is not None:
+        if target_index is not None:
+            undo_desc = f"序号 {target_index}"
+        elif target_round is not None:
             undo_desc = f"轮次 {target_round}"
         elif target_import_id:
             undo_desc = f"导入ID {target_import_id[:12]}..."
@@ -944,9 +960,20 @@ class CLIApp:
         batch_id = self._require_batch()
         target_round = getattr(args, "round", None)
         target_import_id = getattr(args, "import_id", None)
+        target_index = getattr(args, "index", None)
+
+        if target_index is not None:
+            resolved = self.store.resolve_import_by_display_index(batch_id, target_index)
+            if not resolved:
+                print(f"❌ 序号 {target_index} 对应的导入记录不存在", file=sys.stderr)
+                return
+            target_import_id = resolved.get("import_id")
+            print(f"📍 序号 {target_index} → 导入ID {target_import_id[:16]}...")
 
         restore_desc = ""
-        if target_round is not None:
+        if target_index is not None:
+            restore_desc = f"序号 {target_index}"
+        elif target_round is not None:
             restore_desc = f"轮次 {target_round}"
         elif target_import_id:
             restore_desc = f"导入ID {target_import_id[:12]}..."
@@ -993,6 +1020,15 @@ class CLIApp:
         batch_id = self._require_batch()
         target_round = getattr(args, "round", None)
         target_import_id = getattr(args, "import_id", None)
+        target_index = getattr(args, "index", None)
+
+        if target_index is not None:
+            resolved = self.store.resolve_import_by_display_index(batch_id, target_index)
+            if not resolved:
+                print(f"❌ 序号 {target_index} 对应的导入记录不存在", file=sys.stderr)
+                return
+            target_import_id = resolved.get("import_id")
+            print(f"📍 序号 {target_index} → 导入ID {target_import_id[:16]}...")
 
         if target_import_id:
             detail = self.store.get_import_detail(batch_id, import_id=target_import_id)
@@ -1060,6 +1096,178 @@ class CLIApp:
             for inc in consistency.get("inconsistencies", [])[:3]:
                 print(f"   - {inc.get('field')}: 快照={inc.get('snapshot')} 真实={inc.get('real')}")
         print()
+
+    def cmd_import_history(self, args) -> None:
+        batch_id = self._require_batch()
+
+        if getattr(args, "detail", None) is not None:
+            idx = args.detail
+            resolved = self.store.resolve_import_by_display_index(batch_id, idx)
+            if not resolved:
+                print(f"❌ 序号 {idx} 对应的导入记录不存在", file=sys.stderr)
+                return
+            import_id = resolved.get("import_id")
+            print(f"📍 序号 {idx} → 导入ID {import_id[:16]}...")
+            detail = self.store.get_import_detail(batch_id, import_id=import_id)
+            if not detail:
+                print(f"❌ 找不到导入详情", file=sys.stderr)
+                return
+            self._print_import_detail_block(detail, f"序号 {idx}")
+            return
+
+        if getattr(args, "undo", None) is not None:
+            idx = args.undo
+            resolved = self.store.resolve_import_by_display_index(batch_id, idx)
+            if not resolved:
+                print(f"❌ 序号 {idx} 对应的导入记录不存在", file=sys.stderr)
+                return
+            if resolved.get("status") != "active":
+                print(f"❌ 序号 {idx} 的导入状态为「已撤销」，无法再次撤销", file=sys.stderr)
+                return
+            import_id = resolved.get("import_id")
+            print(f"📍 序号 {idx} → 导入ID {import_id[:16]}...")
+            print(f"↩️  正在撤销导入 (序号 {idx}) ...")
+            last = self.store.undo_last_import(batch_id, import_id=import_id)
+            if not last:
+                print("ℹ️  撤销失败，该导入可能已不存在或已撤销")
+                return
+            removed = last.get("removed_event_count_actual", 0)
+            bound = len(last.get("event_ids", []))
+            orphans = len(last.get("orphaned_events_due_to_dedup", []))
+            filename = last.get("filename", "unknown")
+            round_num = last.get("round_number", "?")
+            print(f"✅ 已撤销导入: {filename} (轮次 {round_num})")
+            print(f"   导入时绑定事件数: {bound}")
+            print(f"   实际删除事件数:   {removed}")
+            if orphans > 0:
+                print(f"   因去重合并保留事件: {orphans}")
+            print(f"   删除解析错误数:   {last.get('removed_error_count_actual', 0)}")
+            real_events = len(self.store.load_events(batch_id))
+            print(f"   当前批次事件总数: {real_events}")
+            self.store.log_change(batch_id, "import_history_undo", {
+                "display_index": idx,
+                "import_id": import_id,
+                "filename": filename,
+            }, severity="info")
+            return
+
+        if getattr(args, "restore", None) is not None:
+            idx = args.restore
+            resolved = self.store.resolve_import_by_display_index(batch_id, idx)
+            if not resolved:
+                print(f"❌ 序号 {idx} 对应的导入记录不存在", file=sys.stderr)
+                return
+            if resolved.get("status") != "undone":
+                print(f"❌ 序号 {idx} 的导入状态为「激活」，无需恢复", file=sys.stderr)
+                return
+            import_id = resolved.get("import_id")
+            print(f"📍 序号 {idx} → 导入ID {import_id[:16]}...")
+            print(f"↪️  正在恢复导入 (序号 {idx}) ...")
+            result = self.store.restore_import(batch_id, import_id=import_id)
+            if not result:
+                print("ℹ️  恢复失败，该撤销记录可能已不存在")
+                return
+            filename = result.get("filename", "unknown")
+            round_num = result.get("round_number", "?")
+            restore_count = result.get("restored_count", 1)
+            restored_events = result.get("restored_event_count", 0)
+            already_present = result.get("already_present_event_count", 0)
+            print(f"✅ 已恢复导入: {filename} (轮次 {round_num})")
+            print(f"   恢复次数累计:     {restore_count}")
+            print(f"   恢复关联事件数:   {restored_events}")
+            if already_present > 0:
+                print(f"   已存在于库中:     {already_present} (因后续导入或去重已存在)")
+            print(f"   恢复解析错误数:   {result.get('restored_error_count', 0)}")
+            real_events = len(self.store.load_events(batch_id))
+            print(f"   当前批次事件总数: {real_events}")
+            self.store.log_change(batch_id, "import_history_restore", {
+                "display_index": idx,
+                "import_id": import_id,
+                "filename": filename,
+            }, severity="info")
+            return
+
+        show_all = getattr(args, "all", False)
+        all_entries = self.store.get_all_imports_with_index(batch_id)
+        if not show_all:
+            display_entries = all_entries
+        else:
+            display_entries = all_entries
+
+        print("=" * 98)
+        title = "导入历史记录 (全部)" if show_all else "导入历史记录"
+        print(f"📋 {title} (共 {len(display_entries)} 条):")
+        print("=" * 98)
+        print(f"{'序号':<6} {'状态':<8} {'轮次':<6} {'类型':<12} {'文件名':<30} {'事件数':<8} {'导入时间'}")
+        print("-" * 98)
+
+        if not display_entries:
+            print("   (暂无导入记录)")
+        else:
+            for entry in display_entries:
+                if not show_all and entry.get("status") == "undone":
+                    continue
+                idx = entry.get("display_index", 0)
+                status_icon = "✅" if entry.get("status") == "active" else "↩️"
+                status_text = f"{status_icon} {entry.get('status', '?')}"
+                stype = self.store._infer_source_type(entry.get("filename", ""))
+                ec = entry.get("event_count", 0)
+                fname = entry.get("filename", "")
+                ts = entry.get("imported_at", "")[:19].replace("T", " ")
+                rn = entry.get("round_number", "?")
+                print(f"{idx:<6} {status_text:<8} {rn:<6} {stype:<12} {fname:<30} {ec:<8} {ts}")
+                if entry.get("status") == "undone":
+                    undone_ts = entry.get("undone_at", "")[:19].replace("T", " ")
+                    removed = entry.get("removed_event_count_actual", 0)
+                    print(f"       撤销于: {undone_ts}  实际删除事件: {removed}")
+
+        print()
+        print("💡 提示:")
+        print("   使用 --detail <序号> 查看指定导入的详情")
+        print("   使用 --undo <序号>   撤销指定导入")
+        print("   使用 --restore <序号> 恢复指定已撤销的导入")
+        print("   使用 --all            显示含已撤销的全部记录")
+        print("   undo-import / restore-import / import-detail 也支持 --index <序号>")
+
+    def _print_import_detail_block(self, detail: Dict, desc: str) -> None:
+        status_label = {"active": "✅ 激活", "undone": "↩️ 已撤销"}.get(
+            detail.get("status", "unknown"), detail.get("status", "未知")
+        )
+
+        print("=" * 78)
+        print(f"📋 导入详情 - {desc}")
+        print("=" * 78)
+        print(f"   文件名:       {detail.get('filename', '')}")
+        print(f"   导入轮次:     {detail.get('round_number', '?')}")
+        print(f"   导入ID:       {detail.get('import_id', '')}")
+        print(f"   状态:         {status_label}")
+        print(f"   导入时间:     {detail.get('imported_at', '')}")
+        if detail.get("status") == "undone":
+            print(f"   撤销时间:     {detail.get('undone_at', '')}")
+            print(f"   实际删除事件: {detail.get('removed_event_count_actual', 0)}")
+            print(f"   孤留事件(去重): {len(detail.get('orphaned_events_due_to_dedup', []))}")
+            if detail.get("restored_count", 0) > 0:
+                print(f"   历史恢复次数: {detail.get('restored_count', 0)}")
+                print(f"   最后恢复时间: {detail.get('last_restored_at', '')}")
+        print()
+        print(f"   导入时声明:   {detail.get('event_count', 0)} 事件, {detail.get('error_count', 0)} 错误")
+        print(f"   实际匹配事件: {detail.get('matched_event_count', 0)} 条")
+        print(f"   文件哈希:     {detail.get('file_hash', '')[:16]}...")
+        print(f"   绝对路径:     {detail.get('abs_path', '')}")
+        print()
+
+        matched = detail.get("matched_events_sample", [])
+        if matched:
+            print(f"📝 关联事件样本 (最多10条):")
+            print(f"   {'状态':<10} {'严重级别':<10} {'时间':<20} 消息")
+            print("-" * 78)
+            for ev in matched:
+                active_marker = "✅" if ev.get("active_in_event") else "⚠️"
+                ts = ev.get("timestamp", "")[:19].replace("T", " ")
+                msg = ev.get("message", "")[:50]
+                print(f"   {active_marker} {ev.get('status',''):<8} {ev.get('severity',''):<8} {ts} {msg}")
+                print(f"      ID: {ev.get('id', '')}")
+            print()
 
     def cmd_timeline(self, args) -> None:
         batch_id = self._require_batch()
@@ -1350,7 +1558,10 @@ class CLIApp:
                 print("❌ 导出内容与实际数据不一致")
                 for mm in verify.get("mismatches", []):
                     if "field" in mm:
+                        reason = mm.get("reason", "")
                         print(f"   ⚠️  {mm['field']}: 导出={mm['export']} 实际={mm['actual']} (差 {mm['diff']:+d})")
+                        if reason:
+                            print(f"       原因: {reason}")
                     elif "type" in mm:
                         print(f"   ⚠️  {mm['type']}: {mm.get('details', [])[:2]}")
 
@@ -1908,14 +2119,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_undo = subparsers.add_parser("undo-import", help="撤销文件导入（默认最近一次）")
     p_undo.add_argument("--round", type=int, help="按轮次号撤销指定导入")
     p_undo.add_argument("--import-id", type=str, help="按导入ID撤销指定导入")
+    p_undo.add_argument("--index", type=int, help="按 import-history 列表中的显示序号撤销")
 
     p_restore = subparsers.add_parser("restore-import", help="恢复被撤销的导入（默认最近撤销）")
     p_restore.add_argument("--round", type=int, help="按轮次号恢复指定导入")
     p_restore.add_argument("--import-id", type=str, help="按导入ID恢复指定导入")
+    p_restore.add_argument("--index", type=int, help="按 import-history 列表中的显示序号恢复")
 
     p_import_detail = subparsers.add_parser("import-detail", help="查看某轮导入的详情、变化摘要和冲突原因")
     p_import_detail.add_argument("--round", type=int, help="按轮次号查看")
     p_import_detail.add_argument("--import-id", type=str, help="按导入ID查看")
+    p_import_detail.add_argument("--index", type=int, help="按 import-history 列表中的显示序号查看")
+
+    p_import_history = subparsers.add_parser("import-history", help="查看导入历史列表（含已撤销记录），可用序号操作")
+    p_import_history.add_argument("--detail", type=int, metavar="INDEX", help="查看指定序号的导入详情")
+    p_import_history.add_argument("--undo", type=int, metavar="INDEX", help="撤销指定序号的导入")
+    p_import_history.add_argument("--restore", type=int, metavar="INDEX", help="恢复指定序号的已撤销导入")
+    p_import_history.add_argument("--all", action="store_true", help="显示全部记录（含已撤销）")
 
     p_timeline = subparsers.add_parser("timeline", help="查看排序后的时间线")
     p_timeline.add_argument("--limit", "-n", type=int, help="显示事件数量限制")

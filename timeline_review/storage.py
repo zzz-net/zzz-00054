@@ -66,6 +66,9 @@ class StateStore:
     def _undo_history_path(self, batch_id: str) -> Path:
         return self._get_batch_dir(batch_id) / "undo_history.json"
 
+    def _import_index_map_path(self, batch_id: str) -> Path:
+        return self._get_batch_dir(batch_id) / "import_index_map.json"
+
     def _active_batch_path(self) -> Path:
         return self.storage_dir / "active_batch.json"
 
@@ -106,6 +109,7 @@ class StateStore:
         self._write_imports_index(batch_id, [])
         self._write_label_history(batch_id, [])
         self._write_undo_history(batch_id, [])
+        self._write_import_index_map(batch_id, {})
         self._set_active_batch(batch_id)
         self.refresh_overview_snapshot(batch_id, trigger="create")
         return meta
@@ -255,6 +259,49 @@ class StateStore:
 
     def get_undo_history(self, batch_id: str) -> List[Dict]:
         return self._read_undo_history(batch_id)
+
+    def _read_import_index_map(self, batch_id: str) -> Dict:
+        path = self._import_index_map_path(batch_id)
+        if not path.exists():
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return {}
+
+    def _write_import_index_map(self, batch_id: str, mapping: Dict) -> None:
+        self._ensure_batch_dir(batch_id)
+        with open(self._import_index_map_path(batch_id), "w", encoding="utf-8") as f:
+            json.dump(mapping, f, ensure_ascii=False, indent=2)
+
+    def get_all_imports_with_index(self, batch_id: str) -> List[Dict]:
+        all_entries = self._read_imports_index(batch_id)
+        old_map = self._read_import_index_map(batch_id)
+        new_map = {}
+        for i, entry in enumerate(all_entries, 1):
+            import_id = entry.get("import_id", "")
+            new_map[str(i)] = import_id
+            entry["display_index"] = i
+        self._write_import_index_map(batch_id, new_map)
+        self.log_change(batch_id, "import_index_map_refreshed", {
+            "total_entries": len(all_entries),
+            "mapped_indices": len(new_map),
+        }, severity="debug")
+        return all_entries
+
+    def resolve_import_by_display_index(self, batch_id: str, display_index: int) -> Optional[Dict]:
+        all_entries = self.get_all_imports_with_index(batch_id)
+        for entry in all_entries:
+            if entry.get("display_index") == display_index:
+                return entry
+        old_map = self._read_import_index_map(batch_id)
+        import_id = old_map.get(str(display_index))
+        if import_id:
+            for entry in all_entries:
+                if entry.get("import_id") == import_id:
+                    return entry
+        return None
 
     def _record_label_change(self, batch_id: str, event_id: str, operation: str,
                              old_status: Optional[EventStatus] = None,
@@ -464,6 +511,12 @@ class StateStore:
                 result["actions"].append(f"升级了 {repaired} 条导入记录的结构")
                 result["rebuilt"] = True
 
+            try:
+                self.get_all_imports_with_index(batch_id)
+                result["actions"].append("已重建导入显示索引映射")
+            except Exception as e:
+                result["errors"].append(f"重建导入索引映射失败: {e}")
+
             self.log_change(batch_id, "state_rebuilt_after_restart", result, severity="info")
         except Exception as e:
             result["errors"].append(str(e))
@@ -499,13 +552,23 @@ class StateStore:
                     count_in_export = max(0, len(csv_lines) - 1)
 
             result["checks"].append(f"导出文件中事件数: {count_in_export}")
-            if count_in_export > 0 and count_in_export != real_count:
+            if count_in_export == 0 and real_count > 0:
+                result["consistent"] = False
+                result["mismatches"].append({
+                    "field": "event_count",
+                    "export": 0,
+                    "actual": real_count,
+                    "diff": real_count,
+                    "reason": "导出文件中事件数为0，但实际存在事件",
+                })
+            elif count_in_export > 0 and count_in_export != real_count:
                 result["consistent"] = False
                 result["mismatches"].append({
                     "field": "event_count",
                     "export": count_in_export,
                     "actual": real_count,
                     "diff": real_count - count_in_export,
+                    "reason": "导出文件事件数与实际不一致",
                 })
 
             consistency = self.check_snapshot_consistency(batch_id)
@@ -945,6 +1008,7 @@ class StateStore:
         index[target_idx]["restored_count"] = index[target_idx].get("restored_count", 0) + 1
         index[target_idx]["last_restored_at"] = datetime.now().isoformat()
         self._write_imports_index(batch_id, index)
+        self.get_all_imports_with_index(batch_id)
         self.update_batch_meta(batch_id, event_count=len(self.load_events(batch_id)))
 
         source_type = self._infer_source_type(restore_filename)
@@ -1855,6 +1919,30 @@ class StateStore:
                 else:
                     result["recommendation"] = "check_hash"
                 break
+
+        if not result["is_duplicate"]:
+            undone = self.get_undone_imports(batch_id)
+            for entry in undone:
+                if entry.get("abs_path") == abs_path or entry.get("filename") == filename:
+                    result["is_duplicate"] = True
+                    result["existing_entry"] = {
+                        "filename": entry.get("filename"),
+                        "abs_path": entry.get("abs_path"),
+                        "file_hash": entry.get("file_hash", "")[:16],
+                        "event_count": entry.get("event_count", 0),
+                        "error_count": entry.get("error_count", 0),
+                        "imported_at": entry.get("imported_at"),
+                        "status": "undone",
+                    }
+                    result["recommendation"] = "restore_or_force"
+                    break
+
+        self.log_change(batch_id, "duplicate_import_check", {
+            "file_path": abs_path,
+            "is_duplicate": result["is_duplicate"],
+            "recommendation": result["recommendation"],
+            "hash_changed": result["hash_changed"],
+        }, severity="debug")
 
         return result
 
