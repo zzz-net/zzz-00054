@@ -27,10 +27,12 @@ STATUS_ICONS = {
 
 
 class MarkdownExporter:
-    def __init__(self, timeline: Timeline, config: RuleConfig, batch_meta: Optional[Dict] = None):
+    def __init__(self, timeline: Timeline, config: RuleConfig, batch_meta: Optional[Dict] = None,
+                 history_data: Optional[Dict] = None):
         self.timeline = timeline
         self.config = config
         self.batch_meta = batch_meta or {}
+        self.history_data = history_data or {}
 
     def _format_header(self) -> str:
         lines = []
@@ -198,10 +200,96 @@ class MarkdownExporter:
         lines.append("")
         return "\n".join(lines)
 
+    def _format_history_summary(self) -> str:
+        if not self.history_data:
+            return ""
+
+        trigger_labels = {
+            "create": "创建批次",
+            "import": "导入数据",
+            "reimport": "重新导入",
+            "undo_import": "撤销导入",
+            "config": "配置变更",
+            "label": "标注事件",
+            "undo_label": "撤销标注",
+            "export": "导出报告",
+            "manual": "手动刷新",
+            "repair": "修复快照",
+            "restore": "恢复快照",
+        }
+
+        lines = []
+        lines.append("## 📜 操作历史摘要")
+        lines.append("")
+
+        rounds = self.history_data.get("rounds", [])
+        if rounds:
+            lines.append(f"共执行 **{len(rounds)}** 轮操作:")
+            lines.append("")
+            lines.append("| 轮次 | 触发原因 | 事件数(前→后) | 导入文件(前→后) | 规则版本 | 时间 |")
+            lines.append("|-----|---------|--------------|----------------|---------|------|")
+            for r in rounds:
+                trigger = trigger_labels.get(r.get("trigger", "unknown"), r.get("trigger", "unknown"))
+                ev_before = r.get("before_event_count", 0)
+                ev_after = r.get("after_event_count", 0)
+                ev_change = ev_after - ev_before
+                ev_change_str = f"+{ev_change}" if ev_change > 0 else str(ev_change)
+                imp_before = r.get("before_import_count", 0)
+                imp_after = r.get("after_import_count", 0)
+                imp_change = imp_after - imp_before
+                imp_change_str = f"+{imp_change}" if imp_change > 0 else str(imp_change)
+                created_at = r.get("created_at", "").replace("T", " ")[:19]
+                rule_ver = r.get("rule_version", "unknown")
+                lines.append(f"| {r.get('round_number', 0)} | {trigger} | {ev_before}→{ev_after}({ev_change_str}) | {imp_before}→{imp_after}({imp_change_str}) | {rule_ver} | {created_at} |")
+            lines.append("")
+
+        recent_changes = self.history_data.get("recent_changes", [])
+        if recent_changes:
+            lines.append("### 主要变更摘要")
+            lines.append("")
+            for change in recent_changes[:10]:
+                lines.append(f"- {change}")
+            lines.append("")
+
+        exports = self.history_data.get("exports", [])
+        if exports:
+            lines.append("### 导出历史")
+            lines.append("")
+            lines.append("| # | 文件名 | 大小 | 导出时间 |")
+            lines.append("|---|-------|------|---------|")
+            for i, exp in enumerate(exports[:5], 1):
+                modified_at = exp.get("modified_at", "").replace("T", " ")[:19]
+                lines.append(f"| {i} | {exp.get('filename', '')} | {exp.get('size', 0)} 字节 | {modified_at} |")
+            lines.append("")
+
+        consistency = self.history_data.get("consistency", {})
+        if consistency:
+            lines.append("### 数据一致性检查")
+            lines.append("")
+            if consistency.get("consistent", False):
+                lines.append("✅ 数据一致性检查通过")
+            else:
+                lines.append("⚠️  **警告**: 检测到数据不一致")
+                inconsistencies = consistency.get("inconsistencies", [])
+                if inconsistencies:
+                    lines.append("")
+                    lines.append("| 字段 | 快照值 | 真实值 | 差异 |")
+                    lines.append("|-----|-------|-------|------|")
+                    for inc in inconsistencies:
+                        diff = inc.get("diff", 0)
+                        diff_str = f"+{diff}" if diff > 0 else str(diff)
+                        lines.append(f"| {inc.get('field', '')} | {inc.get('snapshot', 0)} | {inc.get('real', 0)} | {diff_str} |")
+            lines.append("")
+
+        return "\n".join(lines)
+
     def export(self) -> str:
         parts = []
         parts.append(self._format_header())
         parts.append(self._format_stats())
+        history_section = self._format_history_summary()
+        if history_section:
+            parts.append(history_section)
         phases_section = self._format_phases()
         if phases_section:
             parts.append(phases_section)
@@ -214,10 +302,45 @@ class MarkdownExporter:
 
 
 class CSVExporter:
-    def __init__(self, timeline: Timeline, config: RuleConfig, batch_meta: Optional[Dict] = None):
+    def __init__(self, timeline: Timeline, config: RuleConfig, batch_meta: Optional[Dict] = None,
+                 history_data: Optional[Dict] = None):
         self.timeline = timeline
         self.config = config
         self.batch_meta = batch_meta or {}
+        self.history_data = history_data or {}
+
+    def _format_history_summary_csv(self) -> str:
+        if not self.history_data:
+            return ""
+        import csv
+        import io
+        output = io.StringIO()
+        output.write("\n\n# === 操作历史摘要 ===\n")
+
+        rounds = self.history_data.get("rounds", [])
+        if rounds:
+            output.write(f"# 总操作轮次: {len(rounds)}\n")
+            writer = csv.writer(output)
+            writer.writerow(["轮次", "触发原因", "事件数(前→后)", "导入文件(前→后)", "规则版本", "时间"])
+            for r in rounds:
+                ev_before = r.get("before_event_count", 0)
+                ev_after = r.get("after_event_count", 0)
+                ev_change = ev_after - ev_before
+                ev_change_str = f"+{ev_change}" if ev_change > 0 else str(ev_change)
+                imp_before = r.get("before_import_count", 0)
+                imp_after = r.get("after_import_count", 0)
+                imp_change = imp_after - imp_before
+                imp_change_str = f"+{imp_change}" if imp_change > 0 else str(imp_change)
+                created_at = r.get("created_at", "").replace("T", " ")[:19]
+                writer.writerow([
+                    r.get("round_number", 0),
+                    r.get("trigger", "unknown"),
+                    f"{ev_before}→{ev_after}({ev_change_str})",
+                    f"{imp_before}→{imp_after}({imp_change_str})",
+                    r.get("rule_version", "unknown"),
+                    created_at,
+                ])
+        return output.getvalue()
 
     def export(self) -> str:
         output = io.StringIO()
@@ -254,13 +377,17 @@ class CSVExporter:
                 "raw_event_count": len(event.raw_events),
                 "dedup_key": event.dedup_key,
             })
+        history_summary = self._format_history_summary_csv()
+        if history_summary:
+            output.write(history_summary)
         return output.getvalue()
 
 
 def export_report(timeline: Timeline, config: RuleConfig, format: str,
-                  batch_meta: Optional[Dict] = None) -> str:
+                  batch_meta: Optional[Dict] = None,
+                  history_data: Optional[Dict] = None) -> str:
     if format.lower() == "csv":
-        exporter = CSVExporter(timeline, config, batch_meta)
+        exporter = CSVExporter(timeline, config, batch_meta, history_data)
     else:
-        exporter = MarkdownExporter(timeline, config, batch_meta)
+        exporter = MarkdownExporter(timeline, config, batch_meta, history_data)
     return exporter.export()

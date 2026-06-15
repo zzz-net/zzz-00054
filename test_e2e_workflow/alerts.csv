@@ -1,0 +1,18 @@
+timestamp,severity,message,source,host
+2026-06-14 09:30:15,WARNING,Memory usage exceeds 80% threshold,monitoring,web-01
+2026-06-14 09:45:30,ERROR,Payment gateway timeout,payment-service,pay-01
+2026-06-14 09:45:32,ERROR,Payment gateway timeout,payment-service,pay-02
+2026-06-14 09:45:35,P1,500 error rate > 5% for payment API,monitoring,lb-01
+2026-06-14 09:45:40,ERROR,Payment gateway timeout,payment-service,pay-01
+2026-06-14 09:45:42,ERROR,Circuit breaker half-open state reached,resilience4j,pay-01
+2026-06-14 09:46:00,P1,Payment processing unavailable for 30s,sre-alerts,mon-01
+2026-06-14 09:46:05,CRITICAL,Circuit breaker OPEN for payment-service,resilience4j,pay-01
+2026-06-14 09:50:00,WARNING,Database query latency spike,mysql-monitor,db-01
+2026-06-14 09:55:00,P2,Pending orders queue size > 10,monitoring,pay-01
+2026-06-14 10:05:00,INFO,Deployment started: payment-service v2.3.0,ci-cd,deploy-01
+2026-06-14 10:08:00,INFO,Health check passing for payment-service v2.3.0,monitoring,pay-01
+2026-06-14 10:12:30,INFO,Circuit breaker CLOSED for payment-service,resilience4j,pay-01
+2026-06-14 10:15:00,WARNING,Pending orders queue size back to normal,monitoring,pay-01
+2026-06-14 10:20:00,P3,System recovery verified by SRE,sre-reports,mon-01
+not-a-date,ERROR,Bad date format row,test,host
+2026-06-14 10:25:00,INFO,All metrics within normal range,monitoring,mon-01

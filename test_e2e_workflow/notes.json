@@ -1,0 +1,62 @@
+[
+  {
+    "timestamp": "2026-06-14 09:15:00",
+    "note": "日常流量低谷期，系统正常运行",
+    "severity": "INFO"
+  },
+  {
+    "time": "2026-06-14 09:30:00",
+    "message": "运维人员：注意到内存使用缓慢上升，决定持续观察",
+    "level": "INFO",
+    "author": "ops_zhang"
+  },
+  {
+    "timestamp": "2026-06-14 09:45:30",
+    "message": "支付网关开始报超时错误，已通知值班工程师排查",
+    "severity": "ERROR",
+    "author": "on_call_li"
+  },
+  {
+    "时间": "2026-06-14 09:46:00",
+    "备注": "初步判断为上游第三方支付接口异常，非我方服务问题",
+    "级别": "CRITICAL",
+    "owner": "支付团队"
+  },
+  {
+    "timestamp": "2026-06-14 09:50:00",
+    "message": "SRE 介入，开始准备回滚预案",
+    "severity": "WARNING",
+    "owner": "SRE"
+  },
+  {
+    "timestamp": "2026-06-14 10:00:00",
+    "content": "与第三方支付确认：他们新版本发布了有问题的变更，正在回滚",
+    "severity": "INFO",
+    "source": "外部沟通"
+  },
+  {
+    "timestamp": "2026-06-14 10:05:00",
+    "message": "决定回滚我方支付服务到 v2.3.0 作为预防措施",
+    "severity": "INFO",
+    "action": "rollback"
+  },
+  {
+    "timestamp": "2026-06-14 10:15:00",
+    "message": "系统恢复正常，订单队列开始消费",
+    "severity": "INFO"
+  },
+  {
+    "timestamp": "2026-06-14 10:30:00",
+    "content": "故障复盘会议预定明天上午10点",
+    "severity": "INFO"
+  },
+  {
+    "message": "这条备注没有时间戳，应该使用当前时间",
+    "severity": "INFO"
+  },
+  {
+    "bad-timestamp": "2026/06/14 10:35:00",
+    "message": "根因确认：第三方支付新版本接口协议变更未同步",
+    "severity": "CRITICAL"
+  }
+]

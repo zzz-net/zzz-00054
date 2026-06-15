@@ -123,6 +123,18 @@ class CLIApp:
             print("   提示: 使用 'create' 创建批次，或 'switch' 切换到已有批次")
             return
 
+        if args.rounds:
+            self._print_rounds(batch_id, args.round_limit)
+            return
+
+        if args.round is not None:
+            self._print_round_detail(batch_id, args.round)
+            return
+
+        if args.round_diff is not None:
+            self._print_round_diff(batch_id, args.round_diff)
+            return
+
         if args.history:
             self._print_snapshot_history(batch_id, args.history_limit)
             return
@@ -1044,8 +1056,10 @@ class CLIApp:
         if not events:
             print("⚠️  批次中没有事件，报告将为空")
 
+        history_data = self._collect_export_history_data(batch_id)
+
         fmt = args.format or "markdown"
-        content = export_report(timeline, config, fmt, meta)
+        content = export_report(timeline, config, fmt, meta, history_data)
 
         if args.output:
             output_path = args.output
@@ -1063,6 +1077,32 @@ class CLIApp:
 
         print(f"✅ 已导出报告: {output_path}")
         print(f"   格式: {fmt.upper()}  大小: {len(content)} 字符")
+        if history_data and history_data.get("rounds"):
+            print(f"   已包含 {len(history_data['rounds'])} 轮操作历史摘要")
+
+    def _collect_export_history_data(self, batch_id: str) -> Dict:
+        try:
+            rounds = self.store.list_rounds(batch_id, limit=100)
+            exports = self.store.get_exports(batch_id)
+            consistency = self.store.check_snapshot_consistency(batch_id)
+
+            recent_changes = []
+            for r in rounds[:20]:
+                summary = r.get("summary", [])
+                for s in summary:
+                    recent_changes.append(s)
+
+            return {
+                "rounds": rounds,
+                "recent_changes": recent_changes,
+                "exports": exports[:10],
+                "consistency": consistency,
+            }
+        except Exception as e:
+            self.store.log_change(batch_id, "export_history_collection_failed", {
+                "error": str(e),
+            }, severity="warning")
+            return {}
 
     def cmd_show(self, args) -> None:
         batch_id = self._require_batch()
@@ -1194,6 +1234,317 @@ class CLIApp:
         remaining = len(self.store.get_label_history(batch_id))
         print(f"   剩余可撤销次数: {remaining}")
 
+    def cmd_history(self, args) -> None:
+        batch_id = self._require_batch()
+
+        if args.recover:
+            self._recover_to_snapshot(batch_id, args.recover, skip_confirmation=args.yes)
+            return
+
+        if args.repair:
+            self._repair_snapshot(batch_id, args.repair)
+            return
+
+        if args.check_lag:
+            self._check_and_print_database_lag(batch_id)
+            return
+
+        if args.check_config:
+            self._check_and_print_config_conflict(batch_id)
+            return
+
+        if args.rounds:
+            self._print_rounds(batch_id, args.limit)
+            return
+
+        if args.round is not None:
+            self._print_round_detail(batch_id, args.round)
+            return
+
+        if args.round_diff is not None:
+            self._print_round_diff(batch_id, args.round_diff)
+            return
+
+        self._print_rounds(batch_id, args.limit)
+
+    def _print_rounds(self, batch_id: str, limit: int) -> None:
+        rounds = self.store.list_rounds(batch_id, limit=limit)
+        trigger_labels = {
+            "create": "创建批次",
+            "import": "导入数据",
+            "reimport": "重新导入",
+            "undo_import": "撤销导入",
+            "config": "配置变更",
+            "label": "标注事件",
+            "undo_label": "撤销标注",
+            "export": "导出报告",
+            "manual": "手动刷新",
+            "auto_refresh": "自动刷新",
+            "repair": "修复快照",
+            "restore": "恢复快照",
+        }
+
+        print("=" * 98)
+        print(f"📜 导入轮次时间线 (最近 {len(rounds)} 轮):")
+        print("=" * 98)
+        print(f"{'轮次':<6} {'触发原因':<12} {'事件数(前→后)':<16} {'导入数(前→后)':<16} {'版本':<10} {'时间'}")
+        print("-" * 98)
+
+        if not rounds:
+            print("   (暂无轮次记录)")
+        else:
+            for r in rounds:
+                trigger = trigger_labels.get(r.get("trigger", "unknown"), r.get("trigger", "unknown"))
+                created_at = r.get("created_at", "").replace("T", " ")[:19]
+                ev_before = r.get("before_event_count", 0)
+                ev_after = r.get("after_event_count", 0)
+                ev_change = ev_after - ev_before
+                ev_change_str = f"+{ev_change}" if ev_change > 0 else str(ev_change)
+                imp_before = r.get("before_import_count", 0)
+                imp_after = r.get("after_import_count", 0)
+                imp_change = imp_after - imp_before
+                imp_change_str = f"+{imp_change}" if imp_change > 0 else str(imp_change)
+                print(f"{r.get('round_number',0):<6} {trigger:<12} {ev_before}→{ev_after}({ev_change_str:<6}) {imp_before}→{imp_after}({imp_change_str:<6}) {r.get('rule_version',''):<10} {created_at}")
+                summary = r.get("summary", [])
+                if summary:
+                    for s in summary[:2]:
+                        print(f"       • {s}")
+                    if len(summary) > 2:
+                        print(f"       ... 还有 {len(summary) - 2} 项变更")
+
+        print()
+        print("💡 提示:")
+        print("   使用 --round <轮次号> 查看轮次详情")
+        print("   使用 --round-diff <轮次号> 查看轮次变更差异")
+        print("   使用 --recover <快照ID> 恢复到指定快照状态")
+
+    def _print_round_detail(self, batch_id: str, round_number: int) -> None:
+        round_info = self.store.get_round(batch_id, round_number)
+        if not round_info:
+            print(f"❌ 找不到轮次: {round_number}")
+            return
+
+        trigger_labels = {
+            "create": "创建批次",
+            "import": "导入数据",
+            "reimport": "重新导入",
+            "undo_import": "撤销导入",
+            "config": "配置变更",
+            "label": "标注事件",
+            "undo_label": "撤销标注",
+            "export": "导出报告",
+            "manual": "手动刷新",
+            "repair": "修复快照",
+            "restore": "恢复快照",
+        }
+        trigger = trigger_labels.get(round_info.get("trigger", "unknown"), round_info.get("trigger", "unknown"))
+
+        print("=" * 78)
+        print(f"📋 轮次详情 - 第 {round_number} 轮")
+        print("=" * 78)
+        print(f"   触发原因: {trigger}")
+        print(f"   操作时间: {round_info.get('created_at', '').replace('T', ' ')}")
+        print(f"   前快照ID: {round_info.get('before_snapshot_id', 'N/A')}")
+        print(f"   后快照ID: {round_info.get('after_snapshot_id', 'N/A')}")
+        print()
+
+        detail = round_info.get("detail", {})
+        if detail:
+            print("📝 操作详情:")
+            for k, v in detail.items():
+                if v:
+                    print(f"   {k}: {v}")
+            print()
+
+        before = round_info.get("before_snapshot")
+        after = round_info.get("after_snapshot")
+        if before and after:
+            print("📊 状态对比:")
+            print(f"   {'字段':<25} {'操作前':<15} {'操作后':<15} {'变化'}")
+            print("-" * 70)
+            fields = [
+                ("event_count", "事件总数"),
+                ("imported_file_count", "导入文件数"),
+                ("parse_error_count", "解析错误数"),
+                ("label_action_count", "标注操作数"),
+                ("export_count", "导出次数"),
+                ("rule_version", "规则版本"),
+            ]
+            for field, label in fields:
+                old_val = before.get(field, 0)
+                new_val = after.get(field, 0)
+                if field == "rule_version":
+                    diff = f"{old_val} → {new_val}" if old_val != new_val else "无变化"
+                else:
+                    diff_int = new_val - old_val
+                    diff = f"+{diff_int}" if diff_int > 0 else str(diff_int) if diff_int != 0 else "0"
+                print(f"   {label:<25} {str(old_val):<15} {str(new_val):<15} {diff}")
+            print()
+
+        diff = round_info.get("diff")
+        if diff:
+            summary = diff.get("summary", [])
+            if summary:
+                print("📋 变更摘要:")
+                for s in summary:
+                    print(f"   • {s}")
+                print()
+
+        print("💡 提示: 使用 --round-diff <轮次号> 查看详细差异")
+
+    def _print_round_diff(self, batch_id: str, round_number: int) -> None:
+        diff_info = self.store.get_round_diff(batch_id, round_number)
+        if not diff_info:
+            print(f"❌ 找不到轮次: {round_number}")
+            return
+
+        print("=" * 78)
+        print(f"📊 轮次变更差异 - 第 {round_number} 轮")
+        print("=" * 78)
+        print(f"   触发原因: {diff_info.get('trigger', 'unknown')}")
+        print(f"   操作时间: {diff_info.get('created_at', '').replace('T', ' ')}")
+        print(f"   快照对比: {diff_info.get('before_snapshot_id', 'N/A')}  →  {diff_info.get('after_snapshot_id', 'N/A')}")
+        print()
+
+        diff = diff_info.get("diff", {})
+
+        summary = diff.get("summary", [])
+        if summary:
+            print("📋 变更摘要:")
+            for s in summary:
+                print(f"   • {s}")
+            print()
+
+        if diff.get("event_count_change") is not None:
+            change = diff["event_count_change"]
+            arrow = "+" if change > 0 else ""
+            print(f"   事件数变化:    {arrow}{change}")
+            if diff.get("added_events") > 0:
+                print(f"     新增: {diff['added_events']}")
+            if diff.get("removed_events") > 0:
+                print(f"     移除: {diff['removed_events']}")
+            print()
+
+        import_changes = diff.get("import_changes", [])
+        if import_changes:
+            print("   导入变更:")
+            for ic in import_changes:
+                if ic.get("type") == "added":
+                    print(f"     ✅ 新增: {ic.get('filename')} ({ic.get('source_type')}, {ic.get('event_count',0)}事件)")
+                elif ic.get("type") == "removed":
+                    print(f"     ❌ 移除: {ic.get('filename')} ({ic.get('source_type')})")
+            print()
+
+        config_changes = diff.get("config_changes", {})
+        if config_changes:
+            print("   配置变更:")
+            for field, change in config_changes.items():
+                old = change.get("old")
+                new = change.get("new")
+                print(f"     {field}: {old} → {new}")
+            print()
+
+        status_changes = diff.get("status_changes", {})
+        if status_changes:
+            print("   状态分布变化:")
+            for status, change in sorted(status_changes.items()):
+                arrow = "+" if change > 0 else ""
+                print(f"     {status:<8} {arrow}{change}")
+            print()
+
+        label_changes = diff.get("label_changes", [])
+        if label_changes:
+            print("   标注变更:")
+            for lc in label_changes:
+                if lc.get("type") == "label":
+                    print(f"     🏷️  {lc.get('operation')}: {lc.get('event_id_short')} → {lc.get('new_status')}")
+                elif lc.get("type") == "undo":
+                    print(f"     ↩️  {lc.get('undo_type_desc')}")
+            print()
+
+        export_changes = diff.get("export_changes", [])
+        if export_changes:
+            print("   导出变更:")
+            for ec in export_changes:
+                print(f"     📤 新增导出: {ec.get('filename')} ({ec.get('size',0)}字节)")
+            print()
+
+    def _recover_to_snapshot(self, batch_id: str, snapshot_id: str, skip_confirmation: bool = False) -> None:
+        print(f"⚠️  即将恢复到快照: {snapshot_id}")
+        print("   此操作将覆盖当前状态，并创建一个新的恢复轮次")
+        print()
+
+        if not skip_confirmation:
+            import sys
+            print("   确认恢复？输入 'yes' 继续，其他输入取消: ", end="")
+            confirmation = sys.stdin.readline().strip()
+            if confirmation.lower() != "yes":
+                print("   ❌ 已取消恢复")
+                return
+
+        result = self.store.restore_to_snapshot(batch_id, snapshot_id)
+        if result.get("success"):
+            print(f"✅ {result.get('message')}")
+            print(f"   恢复轮次: {result.get('round_number', 'N/A')}")
+        else:
+            print(f"❌ {result.get('message')}")
+            if result.get("error"):
+                print(f"   错误详情: {result.get('error')}")
+
+    def _repair_snapshot(self, batch_id: str, snapshot_id: str) -> None:
+        print(f"🔧 正在修复快照: {snapshot_id}")
+        print()
+        result = self.store.repair_snapshot_file(batch_id, snapshot_id)
+
+        print(f"   修复状态: {'✅ 成功' if result.get('repaired') else '❌ 失败'}")
+        print(f"   消息: {result.get('message', '')}")
+
+        actions = result.get("actions", [])
+        if actions:
+            print()
+            print("   执行的操作:")
+            for a in actions:
+                print(f"   • {a}")
+
+    def _check_and_print_database_lag(self, batch_id: str) -> None:
+        print("🔍 正在检查数据库状态是否落后...")
+        print()
+        result = self.store.check_database_state_lag(batch_id)
+
+        if result.get("is_lagged"):
+            print("❌ 发现数据库状态落后")
+            details = result.get("details", [])
+            for d in details:
+                print(f"   • {d}")
+            print(f"   快照事件数: {result.get('snapshot_event_count', 0)}")
+            print(f"   实际事件数: {result.get('actual_event_count', 0)}")
+            print()
+            print("💡 建议: 使用 --fix 或 refresh_overview_snapshot 刷新快照")
+        else:
+            print("✅ 快照与数据库状态一致")
+            print(f"   快照事件数: {result.get('snapshot_event_count', 0)}")
+            print(f"   实际事件数: {result.get('actual_event_count', 0)}")
+        print()
+
+    def _check_and_print_config_conflict(self, batch_id: str) -> None:
+        print("🔍 正在检查配置冲突...")
+        print()
+        current_config = self.store.load_config(batch_id)
+        result = self.store.check_config_conflict(batch_id, current_config)
+
+        if result.get("has_conflict"):
+            print("❌ 发现配置冲突")
+            conflicts = result.get("conflicts", [])
+            print(f"{'字段':<20} {'当前值':<20} {'新值':<20}")
+            print("-" * 60)
+            for c in conflicts:
+                print(f"   {c.get('label',''):<18} {str(c.get('current','')):<20} {str(c.get('new','')):<20}")
+            print()
+            print("💡 建议: 保存配置后刷新快照，或使用 --bump-version 升级规则版本")
+        else:
+            print("✅ 配置一致，无冲突")
+        print()
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -1244,9 +1595,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_overview.add_argument("--fix", action="store_true", help="自动修复快照不一致问题")
     p_overview.add_argument("--change-log", action="store_true", help="显示变更日志")
     p_overview.add_argument("--log-limit", type=int, default=20, help="变更日志显示数量")
-    p_overview.add_argument("--log-type", choices=["import_change", "config_change", "export_change", "label_change", "snapshot_repair", "other_change", "manual_refresh"], help="按类型过滤变更日志")
+    p_overview.add_argument("--log-type", choices=["import_change", "config_change", "export_change", "label_change", "snapshot_repair", "other_change", "manual_refresh", "round_created", "round_saved"], help="按类型过滤变更日志")
     p_overview.add_argument("--export-diff", action="store_true", help="显示最近导出对比")
     p_overview.add_argument("--refresh", "-r", action="store_true", help="强制刷新快照")
+    p_overview.add_argument("--rounds", action="store_true", help="列出导入轮次时间线")
+    p_overview.add_argument("--round", type=int, help="查看指定轮次详情")
+    p_overview.add_argument("--round-diff", type=int, help="查看指定轮次的变更差异")
+    p_overview.add_argument("--round-limit", type=int, default=20, help="轮次显示数量")
+
+    p_history = subparsers.add_parser("history", help="历史记录与轮次管理")
+    p_history.add_argument("--rounds", action="store_true", help="列出所有导入轮次")
+    p_history.add_argument("--round", type=int, help="查看指定轮次详情")
+    p_history.add_argument("--round-diff", type=int, help="查看指定轮次的变更差异")
+    p_history.add_argument("--limit", type=int, default=20, help="显示数量")
+    p_history.add_argument("--recover", type=str, metavar="SNAPSHOT_ID", help="恢复到指定快照")
+    p_history.add_argument("--repair", type=str, metavar="SNAPSHOT_ID", help="修复损坏的快照文件")
+    p_history.add_argument("--check-lag", action="store_true", help="检查数据库状态是否落后")
+    p_history.add_argument("--check-config", action="store_true", help="检查配置冲突")
+    p_history.add_argument("--yes", "-y", action="store_true", help="自动确认恢复操作，无需交互式确认")
 
     p_import = subparsers.add_parser("import", help="导入日志/告警/备注文件")
     p_import.add_argument("files", nargs="+", help="要导入的文件路径")

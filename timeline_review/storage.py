@@ -560,22 +560,92 @@ class StateStore:
     def _snapshot_consistency_marker_path(self, batch_id: str) -> Path:
         return self._get_batch_dir(batch_id) / "snapshot_consistency.json"
 
-    def _save_historical_snapshot(self, batch_id: str, snapshot: Dict, trigger: str) -> str:
+    def _round_index_path(self, batch_id: str) -> Path:
+        return self._get_batch_dir(batch_id) / "round_index.json"
+
+    def _read_round_index(self, batch_id: str) -> List[Dict]:
+        path = self._round_index_path(batch_id)
+        if not path.exists():
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return []
+
+    def _write_round_index(self, batch_id: str, index: List[Dict]) -> None:
+        self._ensure_batch_dir(batch_id)
+        path = self._round_index_path(batch_id)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(index, f, ensure_ascii=False, indent=2)
+
+    def _get_next_round_number(self, batch_id: str) -> int:
+        index = self._read_round_index(batch_id)
+        if not index:
+            return 1
+        return index[-1].get("round_number", 0) + 1
+
+    def _register_round(self, batch_id: str, trigger: str, before_snapshot_id: str,
+                        after_snapshot_id: str, operation_detail: Dict = None) -> Dict:
+        index = self._read_round_index(batch_id)
+        round_number = self._get_next_round_number(batch_id)
+        round_entry = {
+            "round_number": round_number,
+            "trigger": trigger,
+            "before_snapshot_id": before_snapshot_id,
+            "after_snapshot_id": after_snapshot_id,
+            "created_at": datetime.now().isoformat(),
+            "detail": operation_detail or {},
+        }
+        index.append(round_entry)
+        self._write_round_index(batch_id, index)
+        self.log_change(batch_id, "round_created", {
+            "round_number": round_number,
+            "trigger": trigger,
+            "before_snapshot_id": before_snapshot_id,
+            "after_snapshot_id": after_snapshot_id,
+            "operation_detail": operation_detail,
+        }, severity="info")
+        return round_entry
+
+    def _save_historical_snapshot(self, batch_id: str, snapshot: Dict, trigger: str,
+                                  round_number: int = None) -> str:
+        import shutil
         try:
             snapshots_dir = self._historical_snapshots_dir(batch_id)
             snapshots_dir.mkdir(exist_ok=True)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             snapshot_id = f"snap_{ts}"
+            if round_number is not None:
+                snapshot_id = f"snap_r{round_number:06d}_{ts}"
             filename = f"{snapshot_id}.json"
             filepath = snapshots_dir / filename
+            backup_filepath = snapshots_dir / f"{snapshot_id}.json.bak"
             historical_copy = copy.deepcopy(snapshot)
             historical_copy["snapshot_id"] = snapshot_id
             historical_copy["trigger"] = trigger
             historical_copy["saved_at"] = datetime.now().isoformat()
+            if round_number is not None:
+                historical_copy["round_number"] = round_number
             with open(filepath, "w", encoding="utf-8") as f:
                 json.dump(historical_copy, f, ensure_ascii=False, indent=2)
+            try:
+                shutil.copy2(str(filepath), str(backup_filepath))
+            except Exception:
+                pass
+            self.log_change(batch_id, "snapshot_saved", {
+                "snapshot_id": snapshot_id,
+                "trigger": trigger,
+                "round_number": round_number,
+                "event_count": historical_copy.get("event_count", 0),
+                "imported_file_count": historical_copy.get("imported_file_count", 0),
+            }, severity="debug")
             return snapshot_id
-        except Exception:
+        except Exception as e:
+            self.log_change(batch_id, "snapshot_save_failed", {
+                "trigger": trigger,
+                "error": str(e),
+            }, severity="error")
             return ""
 
     def list_historical_snapshots(self, batch_id: str, limit: int = 20) -> List[Dict]:
@@ -612,9 +682,224 @@ class StateStore:
             return None
         try:
             with open(filepath, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError):
+                data = json.load(f)
+            return data
+        except (json.JSONDecodeError, IOError) as e:
+            self.log_change(batch_id, "snapshot_load_failed", {
+                "snapshot_id": snapshot_id,
+                "error": str(e),
+            }, severity="error")
+            return self._recover_snapshot_from_backup(batch_id, snapshot_id)
+
+    def _recover_snapshot_from_backup(self, batch_id: str, snapshot_id: str) -> Optional[Dict]:
+        snapshots_dir = self._historical_snapshots_dir(batch_id)
+        backup_path = snapshots_dir / f"{snapshot_id}.json.bak"
+        if backup_path.exists():
+            try:
+                with open(backup_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.log_change(batch_id, "snapshot_recovered_from_backup", {
+                    "snapshot_id": snapshot_id,
+                }, severity="warning")
+                original_path = snapshots_dir / f"{snapshot_id}.json"
+                with open(original_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                return data
+            except (json.JSONDecodeError, IOError):
+                pass
+        return None
+
+    def list_rounds(self, batch_id: str, limit: int = 50) -> List[Dict]:
+        index = self._read_round_index(batch_id)
+        result = []
+        for entry in reversed(index[-limit:]):
+            before_snap = self.load_historical_snapshot(batch_id, entry["before_snapshot_id"])
+            after_snap = self.load_historical_snapshot(batch_id, entry["after_snapshot_id"])
+            round_info = {
+                "round_number": entry["round_number"],
+                "trigger": entry["trigger"],
+                "created_at": entry["created_at"],
+                "before_snapshot_id": entry["before_snapshot_id"],
+                "after_snapshot_id": entry["after_snapshot_id"],
+                "before_event_count": before_snap.get("event_count", 0) if before_snap else 0,
+                "after_event_count": after_snap.get("event_count", 0) if after_snap else 0,
+                "before_import_count": before_snap.get("imported_file_count", 0) if before_snap else 0,
+                "after_import_count": after_snap.get("imported_file_count", 0) if after_snap else 0,
+                "rule_version": after_snap.get("rule_version", "unknown") if after_snap else "unknown",
+                "detail": entry.get("detail", {}),
+            }
+            if before_snap and after_snap:
+                diff = self._compare_snapshots(before_snap, after_snap)
+                round_info["summary"] = diff.get("summary", [])
+                round_info["event_count_change"] = diff.get("event_count_change", 0)
+            result.append(round_info)
+        return result
+
+    def get_round(self, batch_id: str, round_number: int) -> Optional[Dict]:
+        index = self._read_round_index(batch_id)
+        for entry in index:
+            if entry["round_number"] == round_number:
+                before_snap = self.load_historical_snapshot(batch_id, entry["before_snapshot_id"])
+                after_snap = self.load_historical_snapshot(batch_id, entry["after_snapshot_id"])
+                return {
+                    "round_number": entry["round_number"],
+                    "trigger": entry["trigger"],
+                    "created_at": entry["created_at"],
+                    "before_snapshot": before_snap,
+                    "after_snapshot": after_snap,
+                    "before_snapshot_id": entry["before_snapshot_id"],
+                    "after_snapshot_id": entry["after_snapshot_id"],
+                    "detail": entry.get("detail", {}),
+                    "diff": self._compare_snapshots(before_snap, after_snap) if (before_snap and after_snap) else None,
+                }
+        return None
+
+    def get_round_diff(self, batch_id: str, round_number: int) -> Optional[Dict]:
+        round_info = self.get_round(batch_id, round_number)
+        if not round_info:
             return None
+        before = round_info.get("before_snapshot")
+        after = round_info.get("after_snapshot")
+        if not before or not after:
+            return None
+        return {
+            "round_number": round_number,
+            "trigger": round_info["trigger"],
+            "created_at": round_info["created_at"],
+            "diff": self._compare_snapshots(before, after),
+            "before_snapshot_id": round_info["before_snapshot_id"],
+            "after_snapshot_id": round_info["after_snapshot_id"],
+        }
+
+    def check_config_conflict(self, batch_id: str, new_config: RuleConfig) -> Dict:
+        result = {
+            "has_conflict": False,
+            "conflicts": [],
+            "current_config": None,
+            "new_config": None,
+        }
+        try:
+            current_config = self.load_config(batch_id)
+            result["current_config"] = current_config.to_dict()
+            result["new_config"] = new_config.to_dict()
+            fields_to_check = [
+                ("rule_version", "规则版本"),
+                ("dedup_window_seconds", "去重窗口"),
+                ("gap_threshold_seconds", "缺口阈值"),
+                ("dedup_similarity_threshold", "去重相似度"),
+            ]
+            for field, label in fields_to_check:
+                current_val = getattr(current_config, field)
+                new_val = getattr(new_config, field)
+                if current_val != new_val:
+                    result["has_conflict"] = True
+                    result["conflicts"].append({
+                        "field": field,
+                        "label": label,
+                        "current": current_val,
+                        "new": new_val,
+                    })
+        except Exception as e:
+            result["has_conflict"] = True
+            result["error"] = str(e)
+        return result
+
+    def check_database_state_lag(self, batch_id: str) -> Dict:
+        result = {
+            "is_lagged": False,
+            "details": [],
+            "snapshot_event_count": 0,
+            "actual_event_count": 0,
+        }
+        try:
+            snapshot = self.load_overview_snapshot(batch_id, auto_refresh=False)
+            actual_events = len(self.load_events(batch_id))
+            snap_events = snapshot.get("event_count", 0)
+            result["snapshot_event_count"] = snap_events
+            result["actual_event_count"] = actual_events
+            if snap_events != actual_events:
+                result["is_lagged"] = True
+                result["details"].append(f"快照事件数({snap_events})与实际事件数({actual_events})不一致")
+        except Exception as e:
+            result["is_lagged"] = True
+            result["error"] = str(e)
+        return result
+
+    def repair_snapshot_file(self, batch_id: str, snapshot_id: str) -> Dict:
+        result = {
+            "repaired": False,
+            "message": "",
+            "actions": [],
+        }
+        snapshots_dir = self._historical_snapshots_dir(batch_id)
+        filepath = snapshots_dir / f"{snapshot_id}.json"
+        if not filepath.exists():
+            result["message"] = f"快照文件不存在: {snapshot_id}"
+            return result
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            result["message"] = "快照文件完整，无需修复"
+            result["repaired"] = True
+            return result
+        except json.JSONDecodeError as e:
+            result["actions"].append(f"检测到JSON损坏: {e}")
+            backup = self._recover_snapshot_from_backup(batch_id, snapshot_id)
+            if backup:
+                result["repaired"] = True
+                result["actions"].append("已从备份恢复")
+                result["message"] = "快照已从备份恢复"
+            else:
+                result["actions"].append("尝试从相邻快照重建")
+                all_snaps = self.list_historical_snapshots(batch_id, limit=1000)
+                snap_ids = [s["snapshot_id"] for s in all_snaps]
+                if snapshot_id in snap_ids:
+                    idx = snap_ids.index(snapshot_id)
+                    if idx > 0:
+                        prev_snap = self.load_historical_snapshot(batch_id, snap_ids[idx - 1])
+                        if prev_snap:
+                            with open(filepath, "w", encoding="utf-8") as f:
+                                json.dump(prev_snap, f, ensure_ascii=False, indent=2)
+                            result["repaired"] = True
+                            result["actions"].append(f"已使用前一快照 {snap_ids[idx-1]} 重建")
+                            result["message"] = "快照已从前一相邻快照重建"
+            if not result["repaired"]:
+                result["message"] = "无法修复快照，建议从更早的历史状态恢复"
+        return result
+
+    def restore_to_snapshot(self, batch_id: str, snapshot_id: str) -> Dict:
+        result = {
+            "success": False,
+            "message": "",
+            "restored_from": snapshot_id,
+        }
+        try:
+            snapshot = self.load_historical_snapshot(batch_id, snapshot_id)
+            if not snapshot:
+                result["message"] = f"无法加载快照: {snapshot_id}"
+                return result
+            current_snap = self.load_overview_snapshot(batch_id, auto_refresh=False)
+            before_id = self._save_historical_snapshot(batch_id, current_snap, "restore_before")
+            snap_path = self._overview_snapshot_path(batch_id)
+            with open(snap_path, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, ensure_ascii=False, indent=2)
+            self._update_snapshot_consistency_marker(batch_id, snapshot)
+            after_id = self._save_historical_snapshot(batch_id, snapshot, "restore_after")
+            round_number = self._get_next_round_number(batch_id)
+            self._register_round(batch_id, "restore", before_id, after_id, {
+                "restored_from_snapshot": snapshot_id,
+            })
+            self.log_change(batch_id, "snapshot_restored", {
+                "snapshot_id": snapshot_id,
+                "round_number": round_number,
+            }, severity="warning")
+            result["success"] = True
+            result["message"] = f"已恢复到快照 {snapshot_id}"
+            result["round_number"] = round_number
+        except Exception as e:
+            result["message"] = f"恢复失败: {e}"
+            result["error"] = str(e)
+        return result
 
     def _compare_snapshots(self, old_snap: Dict, new_snap: Dict) -> Dict:
         diff = {
@@ -1238,12 +1523,25 @@ class StateStore:
             snapshot["latest_action_kind"] = None
             snapshot["latest_action"] = None
 
+        snapshot_path = self._overview_snapshot_path(batch_id)
         try:
+            if snapshot_path.exists():
+                backup_path = snapshot_path.with_suffix(snapshot_path.suffix + ".bak")
+                import shutil
+                shutil.copy2(str(snapshot_path), str(backup_path))
             self._ensure_batch_dir(batch_id)
-            with open(self._overview_snapshot_path(batch_id), "w", encoding="utf-8") as f:
+            with open(snapshot_path, "w", encoding="utf-8") as f:
                 json.dump(snapshot, f, ensure_ascii=False, indent=2)
+            self.log_change(batch_id, "overview_snapshot_written", {
+                "trigger": trigger,
+                "event_count": snapshot.get("event_count", 0),
+            }, severity="debug")
         except Exception as e:
             snapshot["_write_error"] = str(e)
+            self.log_change(batch_id, "overview_snapshot_write_failed", {
+                "trigger": trigger,
+                "error": str(e),
+            }, severity="error")
 
         if old_snapshot:
             has_changes = False
@@ -1272,6 +1570,9 @@ class StateStore:
                         "config": "config_change",
                         "export": "export_change",
                         "manual": "manual_refresh",
+                        "reimport": "import_change",
+                        "undo_label": "label_change",
+                        "label": "label_change",
                     }
                     change_type = change_type_map.get(trigger, "other_change")
                     self.log_change(batch_id, change_type, {
@@ -1283,23 +1584,29 @@ class StateStore:
                         "config_changes": diff.get("config_changes", {}),
                     }, severity="info")
 
-                    recent_history = self.list_historical_snapshots(batch_id, limit=1)
-                    should_save = True
-                    if recent_history:
-                        last_trigger = recent_history[0].get("trigger")
-                        last_saved_at = recent_history[0].get("saved_at", "")
-                        if last_trigger == trigger and last_saved_at:
-                            try:
-                                last_time = datetime.fromisoformat(last_saved_at)
-                                time_diff = (datetime.now() - last_time).total_seconds()
-                                if time_diff < 0.5:
-                                    should_save = False
-                            except (ValueError, TypeError):
-                                pass
-                    if should_save:
-                        self._save_historical_snapshot(batch_id, old_snapshot, trigger)
-                except Exception:
-                    pass
+                    round_number = self._get_next_round_number(batch_id)
+                    before_id = self._save_historical_snapshot(batch_id, old_snapshot, trigger, round_number)
+                    after_id = self._save_historical_snapshot(batch_id, snapshot, trigger, round_number)
+                    operation_detail = {
+                        "files_imported": [f.get("filename") for f in diff.get("import_changes", []) if f.get("type") == "added"],
+                        "files_removed": [f.get("filename") for f in diff.get("import_changes", []) if f.get("type") == "removed"],
+                        "event_count_change": diff.get("event_count_change", 0),
+                        "config_changes": diff.get("config_changes", {}),
+                    }
+                    self._register_round(batch_id, trigger, before_id, after_id, operation_detail)
+
+                    self.log_change(batch_id, "round_saved", {
+                        "round_number": round_number,
+                        "trigger": trigger,
+                        "before_snapshot_id": before_id,
+                        "after_snapshot_id": after_id,
+                        "has_changes": has_changes,
+                    }, severity="info")
+                except Exception as e:
+                    self.log_change(batch_id, "round_save_failed", {
+                        "trigger": trigger,
+                        "error": str(e),
+                    }, severity="error")
 
         try:
             self._update_snapshot_consistency_marker(batch_id, snapshot)
