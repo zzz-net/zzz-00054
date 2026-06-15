@@ -81,6 +81,8 @@ class Event:
     raw_events: List[RawEvent] = field(default_factory=list)
     extra: Dict[str, Any] = field(default_factory=dict)
     dedup_key: str = ""
+    import_ids: List[str] = field(default_factory=list)
+    import_rounds: List[int] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
 
@@ -98,6 +100,8 @@ class Event:
             "raw_events": [re.to_dict() for re in self.raw_events],
             "extra": self.extra,
             "dedup_key": self.dedup_key,
+            "import_ids": self.import_ids,
+            "import_rounds": self.import_rounds,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
         }
@@ -118,6 +122,8 @@ class Event:
             raw_events=[RawEvent.from_dict(re) for re in d.get("raw_events", [])],
             extra=d.get("extra", {}),
             dedup_key=d.get("dedup_key", ""),
+            import_ids=d.get("import_ids", []),
+            import_rounds=d.get("import_rounds", []),
             created_at=datetime.fromisoformat(d.get("created_at", datetime.now().isoformat())),
             updated_at=datetime.fromisoformat(d.get("updated_at", datetime.now().isoformat())),
         )
@@ -135,6 +141,7 @@ class ParseError:
     error_type: str
     error_message: str
     raw_content: str = ""
+    import_id: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

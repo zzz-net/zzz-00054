@@ -2,6 +2,7 @@ import argparse
 import sys
 import os
 import io
+import copy
 from pathlib import Path
 from datetime import datetime
 from typing import List, Optional, Dict, Tuple
@@ -34,6 +35,14 @@ class CLIApp:
             print("❌ 没有活动批次，请先使用 'create' 创建批次或 'switch' 切换批次", file=sys.stderr)
             sys.exit(1)
         self.config = self.store.load_config(batch_id)
+        try:
+            rebuild = self.store.rebuild_state_after_restart(batch_id)
+            if rebuild.get("actions"):
+                self.store.log_change(batch_id, "cli_require_batch_rebuild", {
+                    "actions": rebuild.get("actions"),
+                }, severity="debug")
+        except Exception:
+            pass
         return batch_id
 
     def _print_event_short(self, event: Event, idx: int = 0) -> None:
@@ -671,6 +680,7 @@ class CLIApp:
         config = self.store.load_config(batch_id)
         existing_events = self.store.load_events(batch_id)
         existing_ids = {e.id for e in existing_events}
+        pre_round = self.store._get_next_round_number(batch_id)
 
         total_events_imported = 0
         total_errors = 0
@@ -678,6 +688,8 @@ class CLIApp:
         files_skipped = []
         files_warnings = []
         all_errors = list(self.store.load_parse_errors(batch_id))
+        import_ids_created = []
+        per_file_import_data = []
 
         for file_path in args.files:
             path = Path(file_path)
@@ -761,6 +773,8 @@ class CLIApp:
 
             print(f"📥 正在解析: {path.name} ...")
             raw_events, parse_errors = parser.parse(str(path))
+            file_error_refs = [(err.source_file, err.line_number) for err in parse_errors]
+
             all_errors = [e for e in all_errors if e.source_file != path.name]
             all_errors.extend(parse_errors)
 
@@ -779,17 +793,44 @@ class CLIApp:
             if duplicates > 0:
                 print(f"   ℹ️  发现 {duplicates} 个与现有事件 ID 重复，已自动跳过")
 
+            file_event_ids = []
             if unique_new:
                 existing_events.extend(unique_new)
                 for e in unique_new:
                     existing_ids.add(e.id)
+                    file_event_ids.append(e.id)
                 total_events_imported += len(unique_new)
                 print(f"   ✅ 导入 {len(unique_new)} 条新事件")
             else:
                 print(f"   ℹ️  没有新事件需要导入")
 
-            self.store.mark_file_imported(batch_id, abs_path, file_hash, len(unique_new), len(parse_errors))
+            per_file_import_data.append((abs_path, file_hash, file_event_ids, file_error_refs, len(unique_new), len(parse_errors), path.name))
             files_processed.append(path.name)
+
+        self.store.save_parse_errors(batch_id, all_errors)
+
+        import_rounds_for_this_call = []
+        file_import_attachments = []
+        for (abs_path, file_hash, file_event_ids, file_error_refs, ev_cnt, err_cnt, fname) in per_file_import_data:
+            this_round = self.store._get_next_round_number(batch_id)
+            import_rounds_for_this_call.append(this_round)
+            entry = self.store.mark_file_imported(
+                batch_id, abs_path, file_hash, ev_cnt, err_cnt,
+                event_ids=file_event_ids,
+                parse_error_refs=file_error_refs,
+                round_number=this_round,
+            )
+            imp_id = entry.get("import_id", "")
+            import_ids_created.append(imp_id)
+            file_import_attachments.append((imp_id, this_round, file_event_ids, file_error_refs))
+
+        self.store.save_events(batch_id, existing_events)
+
+        for (imp_id, this_round, file_event_ids, file_error_refs) in file_import_attachments:
+            self.store._attach_import_id_to_events(batch_id, imp_id, file_event_ids, this_round)
+            self.store._attach_import_id_to_errors(batch_id, imp_id, file_error_refs)
+
+        existing_events = self.store.load_events(batch_id)
 
         if existing_events:
             print(f"🔍 正在去重归并...")
@@ -799,15 +840,34 @@ class CLIApp:
             merged = before_count - after_count
             if merged > 0:
                 print(f"   ✅ 合并了 {merged} 组重复事件")
+                if merged_pairs:
+                    deduped_by_id = {e.id: e for e in deduped}
+                    orig_by_id = {e.id: e for e in existing_events}
+                    transfer_count = 0
+                    for (removed_id, kept_id) in merged_pairs:
+                        removed = orig_by_id.get(removed_id)
+                        kept = deduped_by_id.get(kept_id)
+                        if removed and kept and hasattr(removed, 'import_ids') and hasattr(kept, 'import_ids'):
+                            if removed.import_ids:
+                                for rid in removed.import_ids:
+                                    if rid not in kept.import_ids:
+                                        kept.import_ids.append(rid)
+                                for r, rid in zip(removed.import_rounds, removed.import_ids):
+                                    if r not in kept.import_rounds:
+                                        kept.import_rounds.append(r)
+                                transfer_count += 1
+                    if import_ids_created and transfer_count > 0:
+                        print(f"   🔗 转移了 {transfer_count} 组导入归属信息 (孤儿事件保护)")
             existing_events = deduped
 
         self.store.save_events(batch_id, existing_events)
-        self.store.save_parse_errors(batch_id, all_errors)
         self.store.save_config(batch_id, config)
 
         print()
         print(f"📦 导入完成:")
         print(f"   处理文件: {len(files_processed)} 个")
+        if import_ids_created:
+            print(f"   导入轮次: {', '.join(str(r) for r in import_rounds_for_this_call)}")
         if files_skipped:
             print(f"   跳过文件: {len(files_skipped)} 个")
             for s in files_skipped:
@@ -835,12 +895,171 @@ class CLIApp:
 
     def cmd_undo_import(self, args) -> None:
         batch_id = self._require_batch()
-        last = self.store.undo_last_import(batch_id)
+        target_round = getattr(args, "round", None)
+        target_import_id = getattr(args, "import_id", None)
+
+        undo_desc = ""
+        if target_round is not None:
+            undo_desc = f"轮次 {target_round}"
+        elif target_import_id:
+            undo_desc = f"导入ID {target_import_id[:12]}..."
+        else:
+            undo_desc = "最近一次"
+
+        print(f"↩️  正在撤销导入 ({undo_desc}) ...")
+        last = self.store.undo_last_import(
+            batch_id, import_id=target_import_id, round_number=target_round
+        )
         if not last:
             print("ℹ️  没有可撤销的导入记录")
+            active_imports = self.store.get_active_imports(batch_id)
+            if active_imports:
+                print(f"   当前有 {len(active_imports)} 个激活的导入记录")
+                for i, imp in enumerate(active_imports[-5:], 1):
+                    print(f"   {i}. 轮次{imp.get('round_number', '?')}: {imp.get('filename')} ({imp.get('event_count', 0)}事件)")
             return
-        print(f"↩️  已撤销导入: {last['filename']}")
-        print(f"   已同步清理对应事件和解析错误")
+
+        removed = last.get("removed_event_count_actual", 0)
+        bound = len(last.get("event_ids", []))
+        orphans = len(last.get("orphaned_events_due_to_dedup", []))
+        filename = last.get("filename", "unknown")
+        round_num = last.get("round_number", "?")
+
+        print(f"✅ 已撤销导入: {filename} (轮次 {round_num})")
+        print(f"   导入时绑定事件数: {bound}")
+        print(f"   实际删除事件数:   {removed}")
+        if orphans > 0:
+            print(f"   因去重合并保留事件: {orphans} (这些事件还被其他导入引用)")
+        print(f"   删除解析错误数:   {last.get('removed_error_count_actual', 0)}")
+
+        snap = self.store.load_overview_snapshot(batch_id, auto_refresh=False)
+        real_events = len(self.store.load_events(batch_id))
+        snap_events = snap.get("event_count", 0)
+        if real_events != snap_events:
+            print(f"⚠️  注意: 概览快照({snap_events})与真实事件({real_events})不一致，正在修复...")
+            self.store.fix_snapshot_inconsistencies(batch_id)
+        print(f"   当前批次事件总数: {real_events}")
+
+    def cmd_restore_import(self, args) -> None:
+        batch_id = self._require_batch()
+        target_round = getattr(args, "round", None)
+        target_import_id = getattr(args, "import_id", None)
+
+        restore_desc = ""
+        if target_round is not None:
+            restore_desc = f"轮次 {target_round}"
+        elif target_import_id:
+            restore_desc = f"导入ID {target_import_id[:12]}..."
+        else:
+            undone = self.store.get_undone_imports(batch_id)
+            if undone:
+                last_undone = undone[-1]
+                restore_desc = f"最近撤销的: {last_undone.get('filename')}"
+            else:
+                restore_desc = "最近一次撤销"
+
+        print(f"↪️  正在恢复导入 ({restore_desc}) ...")
+        result = self.store.restore_import(
+            batch_id, import_id=target_import_id, round_number=target_round
+        )
+        if not result:
+            print("ℹ️  没有可恢复的撤销记录")
+            undone = self.store.get_undone_imports(batch_id)
+            if undone:
+                print(f"   有 {len(undone)} 条可恢复的撤销记录:")
+                for i, imp in enumerate(undone[-5:], 1):
+                    print(f"   {i}. 轮次{imp.get('round_number', '?')}: {imp.get('filename')} "
+                          f"(撤销于 {imp.get('undone_at', '')[:19]})")
+            return
+
+        filename = result.get("filename", "unknown")
+        round_num = result.get("round_number", "?")
+        restore_count = result.get("restored_count", 1)
+        restored_events = result.get("restored_event_count", 0)
+        already_present = result.get("already_present_event_count", 0)
+
+        print(f"✅ 已恢复导入: {filename} (轮次 {round_num})")
+        print(f"   恢复次数累计:     {restore_count}")
+        print(f"   恢复关联事件数:   {restored_events}")
+        if already_present > 0:
+            print(f"   已存在于库中:     {already_present} (因后续导入或去重已存在)")
+        print(f"   恢复解析错误数:   {result.get('restored_error_count', 0)}")
+
+        snap = self.store.load_overview_snapshot(batch_id, auto_refresh=False)
+        real_events = len(self.store.load_events(batch_id))
+        print(f"   当前批次事件总数: {real_events}")
+
+    def cmd_import_detail(self, args) -> None:
+        batch_id = self._require_batch()
+        target_round = getattr(args, "round", None)
+        target_import_id = getattr(args, "import_id", None)
+
+        if target_import_id:
+            detail = self.store.get_import_detail(batch_id, import_id=target_import_id)
+            desc = f"导入ID {target_import_id}"
+        elif target_round is not None:
+            detail = self.store.get_import_detail(batch_id, round_number=target_round)
+            desc = f"轮次 {target_round}"
+        else:
+            active = self.store.get_active_imports(batch_id)
+            if active:
+                detail = self.store.get_import_detail(batch_id, import_id=active[-1].get("import_id"))
+                desc = f"最近一次导入: {active[-1].get('filename')}"
+            else:
+                print("ℹ️  没有导入记录")
+                return
+
+        if not detail:
+            print(f"❌ 找不到 {desc} 的导入详情")
+            return
+
+        status_label = {"active": "✅ 激活", "undone": "↩️ 已撤销"}.get(
+            detail.get("status", "unknown"), detail.get("status", "未知")
+        )
+
+        print("=" * 78)
+        print(f"📋 导入详情 - {desc}")
+        print("=" * 78)
+        print(f"   文件名:       {detail.get('filename', '')}")
+        print(f"   导入轮次:     {detail.get('round_number', '?')}")
+        print(f"   导入ID:       {detail.get('import_id', '')}")
+        print(f"   状态:         {status_label}")
+        print(f"   导入时间:     {detail.get('imported_at', '')}")
+        if detail.get("status") == "undone":
+            print(f"   撤销时间:     {detail.get('undone_at', '')}")
+            print(f"   实际删除事件: {detail.get('removed_event_count_actual', 0)}")
+            print(f"   孤留事件(去重): {len(detail.get('orphaned_events_due_to_dedup', []))}")
+            if detail.get("restored_count", 0) > 0:
+                print(f"   历史恢复次数: {detail.get('restored_count', 0)}")
+                print(f"   最后恢复时间: {detail.get('last_restored_at', '')}")
+        print()
+        print(f"   导入时声明:   {detail.get('event_count', 0)} 事件, {detail.get('error_count', 0)} 错误")
+        print(f"   实际匹配事件: {detail.get('matched_event_count', 0)} 条")
+        print(f"   文件哈希:     {detail.get('file_hash', '')[:16]}...")
+        print(f"   绝对路径:     {detail.get('abs_path', '')}")
+        print()
+
+        matched = detail.get("matched_events_sample", [])
+        if matched:
+            print(f"📝 关联事件样本 (最多10条):")
+            print(f"   {'状态':<10} {'严重级别':<10} {'时间':<20} 消息")
+            print("-" * 78)
+            for ev in matched:
+                active_marker = "✅" if ev.get("active_in_event") else "⚠️"
+                ts = ev.get("timestamp", "")[:19].replace("T", " ")
+                msg = ev.get("message", "")[:50]
+                print(f"   {active_marker} {ev.get('status',''):<8} {ev.get('severity',''):<8} {ts} {msg}")
+                print(f"      ID: {ev.get('id', '')}")
+            print()
+
+        consistency = self.store.check_snapshot_consistency(batch_id)
+        if consistency.get("consistent"):
+            print("✅ 快照与真实数据一致")
+        else:
+            print(f"⚠️  发现 {len(consistency.get('inconsistencies', []))} 处不一致")
+            for inc in consistency.get("inconsistencies", [])[:3]:
+                print(f"   - {inc.get('field')}: 快照={inc.get('snapshot')} 真实={inc.get('real')}")
+        print()
 
     def cmd_timeline(self, args) -> None:
         batch_id = self._require_batch()
@@ -963,6 +1182,34 @@ class CLIApp:
             print(json.dumps(config.to_dict(), ensure_ascii=False, indent=2))
             return
 
+        if getattr(args, "check_conflict", False):
+            print("🔍 正在检查配置变更冲突风险...")
+            proposed = copy.deepcopy(config)
+            if args.dedup_window is not None:
+                proposed.dedup_window_seconds = args.dedup_window
+            if args.gap_threshold is not None:
+                proposed.gap_threshold_seconds = args.gap_threshold
+            if args.bump_version:
+                parts = proposed.rule_version.split(".")
+                parts[-1] = str(int(parts[-1]) + 1)
+                proposed.rule_version = ".".join(parts)
+            conflict = self.store.get_config_conflict_reasons(batch_id, proposed)
+            if conflict.get("has_conflict"):
+                print(f"⚠️  检测到 {len(conflict.get('conflicts', []))} 处配置变更冲突风险:")
+                for c in conflict.get("conflicts", []):
+                    print(f"   ⚠️  {c.get('label', '')}:")
+                    print(f"      当前值: {c.get('current')}  →  新值: {c.get('new')}")
+                    print(f"      原因: {c.get('reason', '')}")
+                print()
+                print("💡 建议:")
+                for rec in conflict.get("recommendations", []):
+                    print(f"   • {rec}")
+            else:
+                print("✅ 未检测到冲突风险")
+            if not any([args.dedup_window is not None, args.gap_threshold is not None,
+                       args.add_severity, args.add_time_format, args.bump_version]):
+                return
+
         changed = False
         if args.dedup_window is not None:
             config.dedup_window_seconds = args.dedup_window
@@ -1005,6 +1252,15 @@ class CLIApp:
                 deduped, _ = dedupe_events(events, config)
                 self.store.save_events(batch_id, deduped)
                 print(f"   ✅ 完成，当前事件数: {len(deduped)}")
+                after_count = len(deduped)
+                before_count = len(events)
+                if before_count != after_count:
+                    print(f"   ℹ️  配置变更导致事件合并: {before_count} → {after_count} (减少 {before_count - after_count})")
+                    self.store.log_change(batch_id, "config_change_dedup_effect", {
+                        "before": before_count,
+                        "after": after_count,
+                        "diff": after_count - before_count,
+                    }, severity="warning")
         else:
             print("ℹ️  没有修改任何配置，使用 --show 查看当前配置")
 
@@ -1079,6 +1335,36 @@ class CLIApp:
         print(f"   格式: {fmt.upper()}  大小: {len(content)} 字符")
         if history_data and history_data.get("rounds"):
             print(f"   已包含 {len(history_data['rounds'])} 轮操作历史摘要")
+
+        if getattr(args, "verify", False):
+            print()
+            print("🔍 正在核对导出内容与实际数据...")
+            with open(output_path, "r", encoding="utf-8") as f:
+                exported_content = f.read()
+            verify = self.store.verify_export_consistency(batch_id, exported_content, fmt)
+            for check in verify.get("checks", []):
+                print(f"   ℹ️  {check}")
+            if verify.get("consistent"):
+                print("✅ 导出内容与实际数据一致")
+            else:
+                print("❌ 导出内容与实际数据不一致")
+                for mm in verify.get("mismatches", []):
+                    if "field" in mm:
+                        print(f"   ⚠️  {mm['field']}: 导出={mm['export']} 实际={mm['actual']} (差 {mm['diff']:+d})")
+                    elif "type" in mm:
+                        print(f"   ⚠️  {mm['type']}: {mm.get('details', [])[:2]}")
+
+        consistency = self.store.check_snapshot_consistency(batch_id)
+        if not consistency.get("consistent"):
+            print()
+            print(f"⚠️  注意: 导出时发现 {len(consistency.get('inconsistencies', []))} 处快照不一致")
+            if getattr(args, "auto_fix", False):
+                print("   正在自动修复...")
+                fix = self.store.fix_snapshot_inconsistencies(batch_id)
+                if fix.get("fixed"):
+                    print(f"   ✅ 已修复")
+                else:
+                    print(f"   ❌ 修复失败: {fix.get('message', '')}")
 
     def _collect_export_history_data(self, batch_id: str) -> Dict:
         try:
@@ -1619,7 +1905,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_import.add_argument("--type", "-t", choices=["log", "csv", "json"], help="强制指定文件类型（不按扩展名判断）")
     p_import.add_argument("--force", "-f", action="store_true", help="强制重新导入已导入过的文件")
 
-    p_undo = subparsers.add_parser("undo-import", help="撤销最近一次文件导入")
+    p_undo = subparsers.add_parser("undo-import", help="撤销文件导入（默认最近一次）")
+    p_undo.add_argument("--round", type=int, help="按轮次号撤销指定导入")
+    p_undo.add_argument("--import-id", type=str, help="按导入ID撤销指定导入")
+
+    p_restore = subparsers.add_parser("restore-import", help="恢复被撤销的导入（默认最近撤销）")
+    p_restore.add_argument("--round", type=int, help="按轮次号恢复指定导入")
+    p_restore.add_argument("--import-id", type=str, help="按导入ID恢复指定导入")
+
+    p_import_detail = subparsers.add_parser("import-detail", help="查看某轮导入的详情、变化摘要和冲突原因")
+    p_import_detail.add_argument("--round", type=int, help="按轮次号查看")
+    p_import_detail.add_argument("--import-id", type=str, help="按导入ID查看")
 
     p_timeline = subparsers.add_parser("timeline", help="查看排序后的时间线")
     p_timeline.add_argument("--limit", "-n", type=int, help="显示事件数量限制")
@@ -1647,6 +1943,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_config.add_argument("--add-severity", help="添加严重级别映射，格式: raw=SEVERITY")
     p_config.add_argument("--add-time-format", help="添加时间戳格式（strftime）")
     p_config.add_argument("--bump-version", action="store_true", help="规则版本号 +1")
+    p_config.add_argument("--check-conflict", action="store_true", help="变更前检查配置冲突风险并给出建议")
 
     p_phase = subparsers.add_parser("phase", help="管理事件阶段")
     p_phase.add_argument("--list", "-l", action="store_true", help="列出所有阶段")
@@ -1660,6 +1957,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_export.add_argument("--format", "-f", choices=["markdown", "csv"], default="markdown", help="导出格式")
     p_export.add_argument("--output", "-o", help="输出文件路径")
     p_export.add_argument("--save-internal", action="store_true", help="同时保存到批次内部存储")
+    p_export.add_argument("--verify", action="store_true", help="导出后核对内容与实际数据一致性")
+    p_export.add_argument("--auto-fix", action="store_true", help="发现快照不一致时自动修复")
 
     p_show = subparsers.add_parser("show", help="显示事件详细信息")
     p_show.add_argument("event_ids", nargs="+", help="事件 ID（支持前缀匹配）")

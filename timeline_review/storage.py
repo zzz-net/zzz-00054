@@ -411,90 +411,562 @@ class StateStore:
                 return True
         return False
 
-    def get_imported_files(self, batch_id: str) -> List[Dict]:
-        return self._read_imports_index(batch_id)
+    def get_imported_files(self, batch_id: str, include_undone: bool = False) -> List[Dict]:
+        all_entries = self._read_imports_index(batch_id)
+        if include_undone:
+            return all_entries
+        return [e for e in all_entries if e.get("status") == "active"]
+
+    def get_active_imports(self, batch_id: str) -> List[Dict]:
+        return self.get_imported_files(batch_id, include_undone=False)
+
+    def get_undone_imports(self, batch_id: str) -> List[Dict]:
+        all_entries = self._read_imports_index(batch_id)
+        return [e for e in all_entries if e.get("status") == "undone"]
+
+    def get_round_imports(self, batch_id: str, round_number: int) -> List[Dict]:
+        all_entries = self._read_imports_index(batch_id)
+        return [e for e in all_entries if e.get("round_number") == round_number]
+
+    def rebuild_state_after_restart(self, batch_id: str) -> Dict:
+        result = {
+            "rebuilt": False,
+            "actions": [],
+            "errors": [],
+        }
+        try:
+            consistency = self.check_snapshot_consistency(batch_id)
+            if not consistency.get("consistent"):
+                result["actions"].append("检测到不一致，自动刷新快照")
+                self.refresh_overview_snapshot(batch_id, trigger="auto_refresh")
+                consistency2 = self.check_snapshot_consistency(batch_id)
+                if consistency2.get("consistent"):
+                    result["actions"].append("快照刷新后已一致")
+                    result["rebuilt"] = True
+                else:
+                    result["errors"].append("快照刷新后仍不一致")
+            else:
+                result["rebuilt"] = True
+                result["actions"].append("重启后状态一致，无需重建")
+
+            index = self._read_imports_index(batch_id)
+            repaired = 0
+            for entry in index:
+                if "status" not in entry:
+                    entry["status"] = "active"
+                    entry.setdefault("import_id", self._generate_import_id())
+                    entry.setdefault("round_number", 0)
+                    entry.setdefault("event_ids", [])
+                    entry.setdefault("parse_error_refs", [])
+                    repaired += 1
+            if repaired:
+                self._write_imports_index(batch_id, index)
+                result["actions"].append(f"升级了 {repaired} 条导入记录的结构")
+                result["rebuilt"] = True
+
+            self.log_change(batch_id, "state_rebuilt_after_restart", result, severity="info")
+        except Exception as e:
+            result["errors"].append(str(e))
+            self.log_change(batch_id, "state_rebuild_failed", {"error": str(e)}, severity="error")
+        return result
+
+    def verify_export_consistency(self, batch_id: str, export_content: str, export_format: str = "markdown") -> Dict:
+        result = {
+            "consistent": True,
+            "checks": [],
+            "mismatches": [],
+        }
+        try:
+            real_events = self.load_events(batch_id)
+            real_count = len(real_events)
+            result["checks"].append(f"实际事件数: {real_count}")
+
+            count_in_export = 0
+            if export_format == "markdown":
+                for line in export_content.splitlines():
+                    if "事件总数:" in line or "事件数:" in line:
+                        for part in line.split():
+                            try:
+                                n = int(part.strip())
+                                if n > 0 and n < 100000:
+                                    count_in_export = n
+                                    break
+                            except ValueError:
+                                pass
+            elif export_format == "csv":
+                csv_lines = [l for l in export_content.splitlines() if l.strip()]
+                if csv_lines:
+                    count_in_export = max(0, len(csv_lines) - 1)
+
+            result["checks"].append(f"导出文件中事件数: {count_in_export}")
+            if count_in_export > 0 and count_in_export != real_count:
+                result["consistent"] = False
+                result["mismatches"].append({
+                    "field": "event_count",
+                    "export": count_in_export,
+                    "actual": real_count,
+                    "diff": real_count - count_in_export,
+                })
+
+            consistency = self.check_snapshot_consistency(batch_id)
+            if not consistency.get("consistent"):
+                result["consistent"] = False
+                result["mismatches"].append({
+                    "type": "snapshot_inconsistent",
+                    "details": consistency.get("inconsistencies", []),
+                })
+
+            self.log_change(batch_id, "export_consistency_verified", result,
+                          severity="info" if result["consistent"] else "warning")
+        except Exception as e:
+            result["consistent"] = False
+            result["checks"].append(f"校验异常: {e}")
+        return result
+
+    def get_import_detail(self, batch_id: str, import_id: str = None,
+                           round_number: int = None) -> Optional[Dict]:
+        entry = self._find_import_entry(batch_id, import_id=import_id, round_number=round_number)
+        if not entry:
+            return None
+        events = self.load_events(batch_id)
+        bound_ids = set(entry.get("event_ids", []))
+        matched_events = []
+        for e in events:
+            if e.id in bound_ids or entry.get("import_id") in e.import_ids:
+                matched_events.append({
+                    "id": e.id[:16] + "..." if len(e.id) > 16 else e.id,
+                    "timestamp": e.timestamp.isoformat(),
+                    "source": e.source.value,
+                    "severity": e.severity.value,
+                    "status": e.status.value,
+                    "message": e.message[:80],
+                    "active_in_event": entry.get("import_id") in e.import_ids,
+                })
+        return {
+            **entry,
+            "matched_event_count": len(matched_events),
+            "matched_events_sample": matched_events[:10],
+        }
+
+    def get_config_conflict_reasons(self, batch_id: str, new_config: RuleConfig) -> Dict:
+        base = self.check_config_conflict(batch_id, new_config)
+        result = {
+            "has_conflict": base.get("has_conflict", False),
+            "conflicts": [],
+            "recommendations": [],
+        }
+        for c in base.get("conflicts", []):
+            field = c.get("field", "")
+            if field == "dedup_window_seconds":
+                result["recommendations"].append(
+                    "去重窗口变更会影响事件合并结果，建议重新导入或刷新快照确认"
+                )
+            if field == "gap_threshold_seconds":
+                result["recommendations"].append(
+                    "缺口阈值变更会影响时间缺口识别，建议重新生成时间线"
+                )
+            if field == "rule_version":
+                result["recommendations"].append(
+                    "规则版本不一致，建议 bump-version 明确记录变更"
+                )
+            result["conflicts"].append({
+                **c,
+                "reason": {
+                    "dedup_window_seconds": "去重窗口直接影响事件合并数量",
+                    "gap_threshold_seconds": "缺口阈值直接影响时间缺口判定",
+                    "dedup_similarity_threshold": "相似度阈值影响去重判定",
+                    "rule_version": "规则版本号用于追溯配置变更",
+                }.get(field, "配置字段已修改"),
+            })
+        return result
+
+    def _generate_import_id(self) -> str:
+        return f"imp_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{uuid.uuid4().hex[:6]}"
 
     def mark_file_imported(self, batch_id: str, file_path: str, file_hash: str,
-                           event_count: int, error_count: int) -> Dict:
+                           event_count: int, error_count: int,
+                           event_ids: List[str] = None,
+                           parse_error_refs: List[Tuple[str, int]] = None,
+                           round_number: int = None) -> Dict:
         abs_path = str(Path(file_path).resolve())
+        import_id = self._generate_import_id()
+        if round_number is None:
+            round_number = self._get_next_round_number(batch_id) - 1
+            if round_number < 1:
+                round_number = 1
         entry = {
+            "import_id": import_id,
             "abs_path": abs_path,
             "filename": os.path.basename(file_path),
             "file_hash": file_hash,
             "event_count": event_count,
             "error_count": error_count,
+            "event_ids": list(event_ids) if event_ids else [],
+            "parse_error_refs": list(parse_error_refs) if parse_error_refs else [],
             "imported_at": datetime.now().isoformat(),
+            "round_number": round_number,
+            "status": "active",
+            "undone_at": None,
+            "restored_count": 0,
         }
         index = self._read_imports_index(batch_id)
         index.append(entry)
         self._write_imports_index(batch_id, index)
+        self.log_change(batch_id, "import_registered", {
+            "import_id": import_id,
+            "filename": entry["filename"],
+            "event_count": event_count,
+            "round_number": round_number,
+        }, severity="info")
         try:
             self.refresh_overview_snapshot(batch_id, trigger="import")
         except Exception:
             pass
         return entry
 
-    def undo_last_import(self, batch_id: str) -> Optional[Dict]:
+    def _attach_import_id_to_events(self, batch_id: str, import_id: str, event_ids: List[str],
+                                   round_number: int) -> int:
+        if not event_ids:
+            return 0
+        events = self.load_events(batch_id)
+        id_set = set(event_ids)
+        modified = 0
+        for e in events:
+            if e.id in id_set:
+                if import_id not in e.import_ids:
+                    e.import_ids.append(import_id)
+                if round_number not in e.import_rounds:
+                    e.import_rounds.append(round_number)
+                modified += 1
+        if modified:
+            data = [e.to_dict() for e in events]
+            self._ensure_batch_dir(batch_id)
+            with open(self._events_path(batch_id), "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        self.log_change(batch_id, "import_attached_to_events", {
+            "import_id": import_id,
+            "attached_count": modified,
+            "round_number": round_number,
+        }, severity="debug")
+        return modified
+
+    def _attach_import_id_to_errors(self, batch_id: str, import_id: str,
+                                     error_refs: List[Tuple[str, int]]) -> int:
+        if not error_refs:
+            return 0
+        errors = self.load_parse_errors(batch_id)
+        ref_set = set((f, ln) for f, ln in error_refs)
+        modified = 0
+        for err in errors:
+            if (err.source_file, err.line_number) in ref_set:
+                if not err.import_id:
+                    err.import_id = import_id
+                    modified += 1
+        if modified:
+            data = [e.to_dict() for e in errors]
+            self._ensure_batch_dir(batch_id)
+            with open(self._parse_errors_path(batch_id), "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        return modified
+
+    def _update_imports_index_entry(self, batch_id: str, import_id: str, **updates) -> Optional[Dict]:
+        index = self._read_imports_index(batch_id)
+        for i, entry in enumerate(index):
+            if entry.get("import_id") == import_id:
+                index[i].update(updates)
+                self._write_imports_index(batch_id, index)
+                return index[i]
+        return None
+
+    def _find_import_entry(self, batch_id: str, import_id: str = None,
+                             round_number: int = None,
+                             status: str = None) -> Optional[Dict]:
+        index = self._read_imports_index(batch_id)
+        if import_id:
+            for entry in reversed(index):
+                if entry.get("import_id") == import_id:
+                    if status is None or entry.get("status") == status:
+                        return entry
+        if round_number is not None:
+            for entry in reversed(index):
+                if entry.get("round_number") == round_number:
+                    if status is None or entry.get("status") == status:
+                        return entry
+        return None
+
+    def undo_last_import(self, batch_id: str, import_id: str = None,
+                          round_number: int = None) -> Optional[Dict]:
         index = self._read_imports_index(batch_id)
         if not index:
             return None
-        last = index.pop()
-        self._write_imports_index(batch_id, index)
-        removed_filename = last.get("filename", "")
-        removed_abs_path = last.get("abs_path", "")
+
+        target_entry = None
+        target_idx = -1
+        if import_id or round_number is not None:
+            for i, entry in enumerate(index):
+                if (import_id and entry.get("import_id") == import_id) or \
+                   (round_number is not None and entry.get("round_number") == round_number and entry.get("status") == "active"):
+                    target_entry = entry
+                    target_idx = i
+                    break
+        else:
+            for i in range(len(index) - 1, -1, -1):
+                if index[i].get("status") == "active":
+                    target_entry = index[i]
+                    target_idx = i
+                    break
+
+        if target_entry is None or target_idx < 0:
+            self.log_change(batch_id, "undo_import_skipped", {
+                            "reason": "no_active_import_found",
+                            "import_id": import_id,
+                            "round_number": round_number,
+                        }, severity="warning")
+            return None
+
+        removed_import_id = target_entry.get("import_id", "")
+        removed_filename = target_entry.get("filename", "")
+        removed_abs_path = target_entry.get("abs_path", "")
+        bound_event_ids = set(target_entry.get("event_ids", []))
+        bound_error_refs = target_entry.get("parse_error_refs", [])
+        removed_round = target_entry.get("round_number", 0)
+
+        self.log_change(batch_id, "undo_import_started", {
+            "import_id": removed_import_id,
+            "filename": removed_filename,
+            "round_number": removed_round,
+            "bound_event_count": len(bound_event_ids),
+        }, severity="info")
+
         removed_event_count = 0
+        kept_events = []
+        orphaned_events = []
+        orphaned_map = {}
+        removed_events_snapshot = []
+        events = self.load_events(batch_id)
+        for e in events:
+            has_other_active = False
+            has_this_import = removed_import_id in e.import_ids
+            other_import_ids = [iid for iid in e.import_ids if iid != removed_import_id]
+            for other_iid in other_import_ids:
+                for entry2 in index:
+                    if entry2.get("import_id") == other_iid and entry2.get("status") == "active":
+                        has_other_active = True
+                        break
+                if has_other_active:
+                    break
+            if has_this_import and not has_other_active:
+                removed_event_count += 1
+                orphaned_events.append(e.id)
+                try:
+                    removed_events_snapshot.append(e.to_dict())
+                except Exception:
+                    pass
+            else:
+                if has_this_import:
+                    new_import_ids = other_import_ids
+                    new_rounds = [r for r in e.import_rounds if r != removed_round]
+                    e.import_ids = new_import_ids
+                    e.import_rounds = new_rounds
+                    if e.id not in orphaned_map:
+                        orphaned_map[e.id] = {
+                            "kept_other_imports": len(other_import_ids),
+                        }
+                kept_events.append(e)
+
+        data = [e.to_dict() for e in kept_events]
+        self._ensure_batch_dir(batch_id)
+        with open(self._events_path(batch_id), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        self.update_batch_meta(batch_id, event_count=len(kept_events))
+
         removed_error_count = 0
-        try:
-            events = self.load_events(batch_id)
-            kept_events = []
-            for e in events:
-                if e.source_file == removed_filename or e.source_file == removed_abs_path:
-                    removed_event_count += 1
-                else:
-                    kept_events.append(e)
-            if removed_event_count > 0 or len(kept_events) != len(events):
-                data = [e.to_dict() for e in kept_events]
-                self._ensure_batch_dir(batch_id)
-                with open(self._events_path(batch_id), "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-                self.update_batch_meta(batch_id, event_count=len(kept_events))
-        except Exception:
-            pass
-        try:
-            errors = self.load_parse_errors(batch_id)
-            kept_errors = []
-            for err in errors:
-                if err.source_file == removed_filename or err.source_file == removed_abs_path:
-                    removed_error_count += 1
-                else:
-                    kept_errors.append(err)
-            if removed_error_count > 0 or len(kept_errors) != len(errors):
-                data = [e.to_dict() for e in kept_errors]
-                self._ensure_batch_dir(batch_id)
-                with open(self._parse_errors_path(batch_id), "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-        try:
-            source_type = self._infer_source_type(removed_filename)
-            self._record_undo(batch_id, "undo_import", {
-                "filename": removed_filename,
-                "abs_path": removed_abs_path,
-                "source_type": source_type,
-                "file_hash": last.get("file_hash", "")[:16] if last.get("file_hash") else "",
-                "imported_at": last.get("imported_at", ""),
-                "imported_event_count": last.get("event_count", 0),
-                "imported_error_count": last.get("error_count", 0),
-                "removed_event_count": removed_event_count,
-                "removed_error_count": removed_error_count,
-            })
-        except Exception:
-            pass
+        kept_errors = []
+        errors = self.load_parse_errors(batch_id)
+        for err in errors:
+            if err.import_id == removed_import_id:
+                removed_error_count += 1
+            else:
+                kept_errors.append(err)
+        data = [e.to_dict() for e in kept_errors]
+        self._ensure_batch_dir(batch_id)
+        with open(self._parse_errors_path(batch_id), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+        index[target_idx]["status"] = "undone"
+        index[target_idx]["undone_at"] = datetime.now().isoformat()
+        index[target_idx]["removed_event_count_actual"] = removed_event_count
+        index[target_idx]["removed_error_count_actual"] = removed_error_count
+        index[target_idx]["orphaned_events_due_to_dedup"] = list(orphaned_map)
+        index[target_idx]["removed_events_snapshot"] = removed_events_snapshot
+        self._write_imports_index(batch_id, index)
+
+        source_type = self._infer_source_type(removed_filename)
+        undo_detail = {
+            "import_id": removed_import_id,
+            "filename": removed_filename,
+            "abs_path": removed_abs_path,
+            "source_type": source_type,
+            "file_hash": target_entry.get("file_hash", "")[:16] if target_entry.get("file_hash") else "",
+            "imported_at": target_entry.get("imported_at", ""),
+            "round_number": removed_round,
+            "imported_event_count": target_entry.get("event_count", 0),
+            "imported_error_count": target_entry.get("error_count", 0),
+            "removed_event_count": removed_event_count,
+            "removed_error_count": removed_error_count,
+            "bound_event_count": len(bound_event_ids),
+            "events_orphaned_count": len(orphaned_map),
+        }
+        self._record_undo(batch_id, "undo_import", undo_detail)
+        self.log_change(batch_id, "undo_import_completed", undo_detail, severity="info")
+
         try:
             self.refresh_overview_snapshot(batch_id, trigger="undo_import")
         except Exception:
             pass
-        return last
+        return target_entry
+
+    def restore_import(self, batch_id: str, import_id: str = None,
+                       round_number: int = None) -> Optional[Dict]:
+        index = self._read_imports_index(batch_id)
+        if not index:
+            return None
+
+        target_entry = None
+        target_idx = -1
+        for i, entry in enumerate(index):
+            if (import_id and entry.get("import_id") == import_id) or \
+               (round_number is not None and entry.get("round_number") == round_number and entry.get("status") == "undone"):
+                target_entry = entry
+                target_idx = i
+                break
+        if target_entry is None or target_idx < 0:
+            for i in range(len(index) - 1, -1, -1):
+                if index[i].get("status") == "undone":
+                    target_entry = index[i]
+                    target_idx = i
+                    break
+
+        if target_entry is None:
+            self.log_change(batch_id, "restore_import_skipped", {
+                            "reason": "no_undone_import_found",
+                            "import_id": import_id,
+                            "round_number": round_number,
+                        }, severity="warning")
+            return None
+
+        restore_import_id = target_entry.get("import_id", "")
+        restore_filename = target_entry.get("filename", "")
+        restore_round = target_entry.get("round_number", 0)
+        bound_event_ids = target_entry.get("event_ids", [])
+        bound_error_refs = target_entry.get("parse_error_refs", [])
+
+        self.log_change(batch_id, "restore_import_started", {
+            "import_id": restore_import_id,
+            "filename": restore_filename,
+            "round_number": restore_round,
+        }, severity="info")
+
+        restored_event_count = 0
+        already_present_count = 0
+        recreated_count = 0
+        events = self.load_events(batch_id)
+        existing_ids = {e.id for e in events}
+        from .models import Event
+
+        snapshot = target_entry.get("removed_events_snapshot", [])
+        snapshot_by_id = {}
+        if snapshot:
+            for sd in snapshot:
+                if isinstance(sd, dict) and "id" in sd:
+                    snapshot_by_id[sd["id"]] = sd
+
+        bound_event_id_set = set(bound_event_ids)
+        recovered_kept_ids = set()
+        for ev in events:
+            if ev.id in bound_event_id_set:
+                if restore_import_id not in ev.import_ids:
+                    ev.import_ids.append(restore_import_id)
+                if restore_round not in ev.import_rounds:
+                    ev.import_rounds.append(restore_round)
+        for eid in bound_event_ids:
+            if eid in existing_ids:
+                already_present_count += 1
+                recovered_kept_ids.add(eid)
+            elif eid in snapshot_by_id:
+                try:
+                    sd = snapshot_by_id[eid]
+                    recovered_event = Event.from_dict(sd)
+                    if restore_import_id not in recovered_event.import_ids:
+                        recovered_event.import_ids.append(restore_import_id)
+                    if restore_round not in recovered_event.import_rounds:
+                        recovered_event.import_rounds.append(restore_round)
+                    events.append(recovered_event)
+                    recreated_count += 1
+                except Exception as ex:
+                    pass
+        restored_event_count = already_present_count + recreated_count
+        existing_ids_after = {e.id for e in events}
+        data = [e.to_dict() for e in events]
+        self._ensure_batch_dir(batch_id)
+        with open(self._events_path(batch_id), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+        restored_error_count = 0
+        errors = self.load_parse_errors(batch_id)
+        existing_err_refs = set((e.source_file, e.line_number) for e in errors)
+        for (sf, ln) in bound_error_refs:
+            if (sf, ln) not in existing_err_refs:
+                from .models import ParseError
+                new_err = ParseError(
+                    source_file=sf,
+                    line_number=ln,
+                    error_type="restored",
+                    error_message="恢复撤销时缺少详细错误信息（原始记录不可用）",
+                    raw_content="",
+                    import_id=restore_import_id,
+                )
+                errors.append(new_err)
+                restored_error_count += 1
+            else:
+                for err in errors:
+                    if err.source_file == sf and err.line_number == ln:
+                        if not err.import_id:
+                            err.import_id = restore_import_id
+                        restored_error_count += 1
+                        break
+        data = [e.to_dict() for e in errors]
+        self._ensure_batch_dir(batch_id)
+        with open(self._parse_errors_path(batch_id), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+        index[target_idx]["status"] = "active"
+        index[target_idx]["undone_at"] = None
+        index[target_idx]["restored_count"] = index[target_idx].get("restored_count", 0) + 1
+        index[target_idx]["last_restored_at"] = datetime.now().isoformat()
+        self._write_imports_index(batch_id, index)
+        self.update_batch_meta(batch_id, event_count=len(self.load_events(batch_id)))
+
+        source_type = self._infer_source_type(restore_filename)
+        restore_detail = {
+            "import_id": restore_import_id,
+            "filename": restore_filename,
+            "source_type": source_type,
+            "round_number": restore_round,
+            "restored_event_count": restored_event_count,
+            "restored_error_count": restored_error_count,
+            "recreated_event_count": recreated_count,
+            "already_present_event_count": already_present_count,
+            "restore_count_total": index[target_idx]["restored_count"],
+        }
+        self._record_undo(batch_id, "restore_import", restore_detail)
+        self.log_change(batch_id, "restore_import_completed", restore_detail, severity="info")
+
+        try:
+            self.refresh_overview_snapshot(batch_id, trigger="reimport")
+        except Exception:
+            pass
+        return target_entry
 
     def _infer_source_type(self, filename: str) -> str:
         ext = Path(filename).suffix.lower()
@@ -867,38 +1339,145 @@ class StateStore:
                 result["message"] = "无法修复快照，建议从更早的历史状态恢复"
         return result
 
-    def restore_to_snapshot(self, batch_id: str, snapshot_id: str) -> Dict:
+    def restore_to_snapshot(self, batch_id: str, snapshot_id: str,
+                             recover_events: bool = True) -> Dict:
         result = {
             "success": False,
             "message": "",
             "restored_from": snapshot_id,
+            "restored_events": 0,
+            "restored_imports": 0,
+            "restored_errors": 0,
+            "actions": [],
         }
         try:
             snapshot = self.load_historical_snapshot(batch_id, snapshot_id)
             if not snapshot:
                 result["message"] = f"无法加载快照: {snapshot_id}"
                 return result
+
+            self.log_change(batch_id, "snapshot_restore_started", {
+                "snapshot_id": snapshot_id,
+                "recover_events": recover_events,
+            }, severity="warning")
+
             current_snap = self.load_overview_snapshot(batch_id, auto_refresh=False)
             before_id = self._save_historical_snapshot(batch_id, current_snap, "restore_before")
+
+            restored_files_info = snapshot.get("imported_files", [])
+            if recover_events and restored_files_info:
+                all_imports = self._read_imports_index(batch_id)
+                target_filenames = {f.get("filename") for f in restored_files_info}
+                target_hashes = {f.get("file_hash", "") for f in restored_files_info if f.get("file_hash")}
+
+                for imp in all_imports:
+                    imp_fname = imp.get("filename", "")
+                    imp_hash = imp.get("file_hash", "")[:16] if imp.get("file_hash") else ""
+                    should_be_active = False
+                    for sf in restored_files_info:
+                        sf_name = sf.get("filename", "")
+                        sf_hash = sf.get("file_hash", "")
+                        if sf_name == imp_fname and (not sf_hash or sf_hash[:16] == imp_hash):
+                            should_be_active = True
+                            break
+                    imp["status"] = "active" if should_be_active else "undone"
+                    if should_be_active:
+                        imp["undone_at"] = None
+                    else:
+                        if not imp.get("undone_at"):
+                            imp["undone_at"] = datetime.now().isoformat()
+                self._write_imports_index(batch_id, all_imports)
+                result["restored_imports"] = sum(
+                    1 for imp in all_imports if imp.get("status") == "active"
+                )
+                result["actions"].append(
+                    f"已调整 {len(all_imports)} 条导入记录的激活状态"
+                )
+
+                active_import_ids = {
+                    imp.get("import_id") for imp in all_imports
+                    if imp.get("status") == "active" and imp.get("import_id")
+                }
+                events = self.load_events(batch_id)
+                kept_events = []
+                removed_count = 0
+                for e in events:
+                    if not e.import_ids:
+                        kept_events.append(e)
+                        continue
+                    has_active = any(iid in active_import_ids for iid in e.import_ids)
+                    if has_active:
+                        new_import_ids = [iid for iid in e.import_ids if iid in active_import_ids]
+                        new_rounds = list({
+                            r for iid, r in zip(e.import_ids, e.import_rounds)
+                            if iid in active_import_ids
+                        })
+                        if not new_import_ids:
+                            new_import_ids = list(active_import_ids & set(e.import_ids))
+                        e.import_ids = new_import_ids
+                        e.import_rounds = new_rounds
+                        kept_events.append(e)
+                    else:
+                        removed_count += 1
+                data = [e.to_dict() for e in kept_events]
+                self._ensure_batch_dir(batch_id)
+                with open(self._events_path(batch_id), "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                self.update_batch_meta(batch_id, event_count=len(kept_events))
+                result["restored_events"] = len(kept_events)
+                result["actions"].append(f"保留 {len(kept_events)} 条事件，移除 {removed_count} 条")
+
+                errors = self.load_parse_errors(batch_id)
+                kept_errors = [e for e in errors if not e.import_id or e.import_id in active_import_ids]
+                data = [e.to_dict() for e in kept_errors]
+                self._ensure_batch_dir(batch_id)
+                with open(self._parse_errors_path(batch_id), "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                result["restored_errors"] = len(kept_errors)
+                result["actions"].append(
+                    f"保留 {len(kept_errors)} 条解析错误，移除 {len(errors) - len(kept_errors)} 条"
+                )
+
             snap_path = self._overview_snapshot_path(batch_id)
             with open(snap_path, "w", encoding="utf-8") as f:
                 json.dump(snapshot, f, ensure_ascii=False, indent=2)
             self._update_snapshot_consistency_marker(batch_id, snapshot)
-            after_id = self._save_historical_snapshot(batch_id, snapshot, "restore_after")
+
+            after_snap = self.refresh_overview_snapshot(batch_id, trigger="restore")
+            after_id = self._save_historical_snapshot(batch_id, after_snap, "restore_after")
+
             round_number = self._get_next_round_number(batch_id)
             self._register_round(batch_id, "restore", before_id, after_id, {
                 "restored_from_snapshot": snapshot_id,
+                "recover_events": recover_events,
+                "restored_event_count": result["restored_events"],
+                "restored_import_count": result["restored_imports"],
             })
             self.log_change(batch_id, "snapshot_restored", {
                 "snapshot_id": snapshot_id,
                 "round_number": round_number,
+                "restored_events": result["restored_events"],
+                "restored_imports": result["restored_imports"],
             }, severity="warning")
             result["success"] = True
-            result["message"] = f"已恢复到快照 {snapshot_id}"
+            result["message"] = f"已恢复到快照 {snapshot_id}，底层数据同步重建完成"
             result["round_number"] = round_number
+
+            verify = self.check_snapshot_consistency(batch_id)
+            if not verify.get("consistent"):
+                result["actions"].append(
+                    f"警告: 恢复后发现 {len(verify.get('inconsistencies', []))} 处不一致"
+                )
+                self.fix_snapshot_inconsistencies(batch_id)
         except Exception as e:
             result["message"] = f"恢复失败: {e}"
             result["error"] = str(e)
+            import traceback
+            self.log_change(batch_id, "snapshot_restore_failed", {
+                "snapshot_id": snapshot_id,
+                "error": str(e),
+                "traceback": traceback.format_exc()[:500],
+            }, severity="error")
         return result
 
     def _compare_snapshots(self, old_snap: Dict, new_snap: Dict) -> Dict:
@@ -1384,10 +1963,15 @@ class StateStore:
             snapshot["_parse_errors_error"] = str(e)
 
         try:
-            imported = self.get_imported_files(batch_id)
+            all_imported = self.get_imported_files(batch_id, include_undone=True)
+            active_imported = [f for f in all_imported if f.get("status") == "active"]
             imported_files = []
-            for f in imported:
-                imported_files.append({
+            undone_count = 0
+            restored_total_count = 0
+            for f in all_imported:
+                is_active = f.get("status") == "active"
+                entry = {
+                    "import_id": f.get("import_id", ""),
                     "filename": f.get("filename", "未知文件"),
                     "abs_path": f.get("abs_path", ""),
                     "source_type": self._infer_source_type(f.get("filename", "")),
@@ -1395,9 +1979,30 @@ class StateStore:
                     "error_count": f.get("error_count", 0),
                     "file_hash": f.get("file_hash", "")[:16] if f.get("file_hash") else "",
                     "imported_at": f.get("imported_at", ""),
-                })
+                    "round_number": f.get("round_number", 0),
+                    "status": f.get("status", "active"),
+                    "bound_event_count": len(f.get("event_ids", [])),
+                }
+                if not is_active:
+                    undone_count += 1
+                    entry["undone_at"] = f.get("undone_at", "")
+                    entry["removed_event_count_actual"] = f.get("removed_event_count_actual", 0)
+                    entry["orphaned_events_due_to_dedup"] = len(f.get("orphaned_events_due_to_dedup", []))
+                    entry["restored_count"] = f.get("restored_count", 0)
+                    restored_total_count += f.get("restored_count", 0)
+                imported_files.append(entry)
             snapshot["imported_files"] = imported_files
-            snapshot["imported_file_count"] = len(imported_files)
+            snapshot["imported_file_count"] = len(active_imported)
+            snapshot["total_import_entries"] = len(all_imported)
+            snapshot["undone_import_count"] = undone_count
+            snapshot["restored_import_total_count"] = restored_total_count
+            if undone_count > 0:
+                snapshot["active_imported_files"] = [
+                    f for f in imported_files if f.get("status") == "active"
+                ]
+                snapshot["undone_imported_files"] = [
+                    f for f in imported_files if f.get("status") == "undone"
+                ]
         except Exception as e:
             snapshot["imported_files"] = []
             snapshot["imported_file_count"] = 0
