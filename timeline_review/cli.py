@@ -1731,6 +1731,468 @@ class CLIApp:
         remaining = len(self.store.get_label_history(batch_id))
         print(f"   剩余可撤销次数: {remaining}")
 
+    def cmd_audit_center(self, args) -> None:
+        batch_id = self._require_batch()
+        config = self.store.load_config(batch_id)
+        audit_rules = config.audit_rules
+
+        if args.show_rules:
+            self._print_audit_rules(audit_rules)
+            return
+
+        if args.enable_check or args.disable_check or args.set_tolerance:
+            self._update_audit_rules(batch_id, config, args)
+            return
+
+        if args.verify_export:
+            self._verify_export_file(batch_id, args.verify_export, args.format)
+            return
+
+        if args.export_audit:
+            self._export_with_audit(batch_id, args)
+            return
+
+        if args.undo is not None:
+            self._audit_undo_import(batch_id, args.undo, args.force)
+            return
+
+        if args.restore is not None:
+            self._audit_restore_import(batch_id, args.restore, args.force)
+            return
+
+        if args.detail is not None:
+            self._audit_show_detail(batch_id, args.detail)
+            return
+
+        if args.list or True:
+            self._audit_show_list(batch_id, args.limit)
+
+    def _print_audit_rules(self, audit_rules) -> None:
+        print("=" * 78)
+        print("📋 当前核对规则配置")
+        print("=" * 78)
+        print(f"   规则总开关:        {'✅ 启用' if audit_rules.enabled else '❌ 禁用'}")
+        print()
+        print("   核对项配置:")
+        print(f"   • 空导出检查:      {'✅ 启用' if audit_rules.check_empty_export else '❌ 禁用'} (容忍度: {audit_rules.empty_export_tolerance})")
+        print(f"   • 数量不一致检查:  {'✅ 启用' if audit_rules.check_event_count_mismatch else '❌ 禁用'} (容忍度: {audit_rules.count_mismatch_tolerance})")
+        print(f"   • 重复恢复检查:    {'✅ 启用' if audit_rules.check_duplicate_restore else '❌ 禁用'}")
+        print(f"   • 导入冲突检查:    {'✅ 启用' if audit_rules.check_import_conflict else '❌ 禁用'}")
+        print()
+        print("   其他配置:")
+        print(f"   • 允许强制重导:    {'✅ 是' if audit_rules.allow_force_reimport else '❌ 否'}")
+        print(f"   • 自动修复快照:    {'✅ 是' if audit_rules.auto_fix_snapshot else '❌ 否'}")
+        print(f"   • 记录变更日志:    {'✅ 是' if audit_rules.log_to_change_log else '❌ 否'}")
+        print(f"   • 日志级别:        {audit_rules.log_level}")
+        print()
+        print("   导出事件数匹配模式:")
+        for pattern in audit_rules.export_count_patterns:
+            print(f"   • {pattern}")
+        print()
+
+    def _update_audit_rules(self, batch_id: str, config, args) -> None:
+        updated = False
+
+        if args.enable_check:
+            checks = [args.enable_check] if args.enable_check != "all" else ["empty_export", "event_count_mismatch", "duplicate_restore", "import_conflict"]
+            for check in checks:
+                if check == "empty_export":
+                    config.audit_rules.check_empty_export = True
+                elif check == "event_count_mismatch":
+                    config.audit_rules.check_event_count_mismatch = True
+                elif check == "duplicate_restore":
+                    config.audit_rules.check_duplicate_restore = True
+                elif check == "import_conflict":
+                    config.audit_rules.check_import_conflict = True
+                print(f"✅ 已启用核对规则: {check}")
+                updated = True
+
+        if args.disable_check:
+            checks = [args.disable_check] if args.disable_check != "all" else ["empty_export", "event_count_mismatch", "duplicate_restore", "import_conflict"]
+            for check in checks:
+                if check == "empty_export":
+                    config.audit_rules.check_empty_export = False
+                elif check == "event_count_mismatch":
+                    config.audit_rules.check_event_count_mismatch = False
+                elif check == "duplicate_restore":
+                    config.audit_rules.check_duplicate_restore = False
+                elif check == "import_conflict":
+                    config.audit_rules.check_import_conflict = False
+                print(f"✅ 已禁用核对规则: {check}")
+                updated = True
+
+        if args.set_tolerance:
+            parts = args.set_tolerance.split("=", 1)
+            if len(parts) == 2:
+                check_name = parts[0].strip()
+                try:
+                    tolerance = int(parts[1].strip())
+                    if check_name == "empty_export":
+                        config.audit_rules.empty_export_tolerance = tolerance
+                    elif check_name == "event_count_mismatch":
+                        config.audit_rules.count_mismatch_tolerance = tolerance
+                    else:
+                        print(f"❌ 未知的检查项: {check_name}", file=sys.stderr)
+                        return
+                    print(f"✅ 已设置 {check_name} 容忍度为: {tolerance}")
+                    updated = True
+                except ValueError:
+                    print(f"❌ 容忍度必须是整数: {parts[1]}", file=sys.stderr)
+                    return
+            else:
+                print(f"❌ 格式错误，请使用 CHECK=TOLERANCE 格式", file=sys.stderr)
+                return
+
+        if updated:
+            self.store.save_config(batch_id, config)
+            print()
+            print("💡 核对规则已更新，新规则将在下次核对时生效")
+
+    def _verify_export_file(self, batch_id: str, file_path: str, fmt: str) -> None:
+        path = Path(file_path)
+        if not path.exists():
+            print(f"❌ 文件不存在: {file_path}", file=sys.stderr)
+            return
+
+        print(f"🔍 正在核对导出文件: {path.name}")
+        print()
+
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        result = self.store.verify_export_consistency(batch_id, content, fmt)
+
+        for check in result.get("checks", []):
+            print(f"   ℹ️  {check}")
+        print()
+
+        if result.get("consistent"):
+            print("✅ 导出内容与库内数据一致，核对通过")
+        else:
+            print("❌ 核对失败，发现不一致:")
+            print()
+            for mm in result.get("mismatches", []):
+                severity = mm.get("severity", "warning")
+                sev_icon = "❌" if severity == "error" else "⚠️"
+                if "field" in mm:
+                    check_type = mm.get("check_type", "unknown")
+                    reason = mm.get("reason", "")
+                    print(f"   {sev_icon} [{check_type}] {reason}")
+                    if "export" in mm and "actual" in mm:
+                        print(f"       导出值: {mm['export']}  实际值: {mm['actual']}  差异: {mm.get('diff', 0):+d}")
+                elif "type" in mm:
+                    print(f"   {sev_icon} [{mm.get('type', 'unknown')}] {mm.get('reason', '')}")
+            print()
+            print(f"📝 未通过的核对项: {', '.join(result.get('failed_checks', []))}")
+            self.store.log_change(batch_id, "audit_verify_export_failed", {
+                "file": file_path,
+                "failed_checks": result.get("failed_checks", []),
+                "mismatches": result.get("mismatches", []),
+            }, severity="error")
+            sys.exit(1)
+
+    def _export_with_audit(self, batch_id: str, args) -> None:
+        events = self.store.load_events(batch_id)
+        config = self.store.load_config(batch_id)
+        meta = self.store.get_batch_meta(batch_id)
+        timeline = Timeline(events, config)
+
+        if not events:
+            print("⚠️  批次中没有事件，报告将为空")
+
+        history_data = self._collect_export_history_data(batch_id)
+
+        fmt = args.format
+        content = export_report(timeline, config, fmt, meta, history_data)
+
+        if args.output:
+            output_path = args.output
+        else:
+            ext = ".csv" if fmt.lower() == "csv" else ".md"
+            output_path = f"audit_report_{meta['id']}{ext}"
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        print(f"✅ 已导出报告: {output_path}")
+        print(f"   格式: {fmt.upper()}  大小: {len(content)} 字符")
+        print()
+        print("🔍 正在执行导出后核对...")
+        print()
+
+        verify_result = self.store.verify_export_consistency(batch_id, content, fmt)
+
+        for check in verify_result.get("checks", []):
+            print(f"   ℹ️  {check}")
+        print()
+
+        if verify_result.get("consistent"):
+            print("✅ 导出核对通过，数据一致")
+        else:
+            print("❌ 导出核对失败!")
+            print()
+            for mm in verify_result.get("mismatches", []):
+                if "check_type" in mm:
+                    print(f"   ❌ [{mm['check_type']}] {mm.get('reason', '')}")
+                elif "type" in mm:
+                    print(f"   ⚠️  [{mm.get('type', 'unknown')}] {mm.get('reason', '')}")
+            print()
+            self.store.log_change(batch_id, "audit_export_with_audit_failed", {
+                "output_file": output_path,
+                "failed_checks": verify_result.get("failed_checks", []),
+            }, severity="error")
+            sys.exit(1)
+
+    def _audit_show_list(self, batch_id: str, limit: int) -> None:
+        operations = self.store.get_audit_operations_list(batch_id, limit=limit)
+
+        print("=" * 110)
+        print(f"📋 导入导出核对中心 - 最近操作列表 (共 {len(operations)} 条，最近 {limit} 条)")
+        print("=" * 110)
+        print(f"{'序号':<6} {'操作类型':<14} {'状态':<10} {'文件名':<24} {'事件数':<8} {'匹配数':<8} {'最后处理时间'}")
+        print("-" * 110)
+
+        if not operations:
+            print("   (暂无操作记录，使用 import 命令导入文件)")
+        else:
+            for op in operations:
+                idx = op.get("display_index", 0)
+                op_type = op.get("operation_type", "未知")
+                status = op.get("status", "unknown")
+                status_icon = "✅" if status == "active" else "↩️"
+                fname = op.get("filename", "")[:22]
+                ev_count = op.get("event_count", 0)
+                matched = op.get("matched_event_count", 0)
+                last_ts = op.get("last_processed_at", "")[:19].replace("T", " ")
+
+                print(f"{idx:<6} {op_type:<14} {status_icon} {status:<8} {fname:<24} {ev_count:<8} {matched:<8} {last_ts}")
+
+        print()
+        print("💡 操作提示:")
+        print("   audit-center --detail <序号>   查看指定操作的详细信息")
+        print("   audit-center --undo <序号>     撤销指定导入")
+        print("   audit-center --restore <序号>  恢复指定已撤销的导入")
+        print("   audit-center --export-audit    导出报告并自动核对")
+        print("   audit-center --verify-export <文件>  核对已有导出文件")
+
+    def _audit_show_detail(self, batch_id: str, display_index: int) -> None:
+        detail = self.store.get_audit_operation_detail(batch_id, display_index)
+        if not detail:
+            print(f"❌ 序号 {display_index} 对应的操作记录不存在", file=sys.stderr)
+            return
+
+        status_label = {"active": "✅ 激活", "undone": "↩️ 已撤销"}.get(
+            detail.get("status", "unknown"), detail.get("status", "未知")
+        )
+
+        print("=" * 90)
+        print(f"📋 操作详情 - 序号 {display_index}")
+        print("=" * 90)
+        print(f"   记录标识(import_id): {detail.get('import_id', '')}")
+        print(f"   操作类型:           {detail.get('operation_type', '未知')}")
+        print(f"   状态:               {status_label}")
+        print(f"   导入轮次:           {detail.get('round_number', '?')}")
+        print()
+        print("📊 事件统计:")
+        event_stats = detail.get("event_stats", {})
+        print(f"   关联事件总数:       {event_stats.get('total', 0)}")
+        by_status = event_stats.get("by_status", {})
+        if by_status:
+            status_str = "  ".join([f"{k}:{v}" for k, v in by_status.items()])
+            print(f"   按状态分布:         {status_str}")
+        by_severity = event_stats.get("by_severity", {})
+        if by_severity:
+            sev_str = "  ".join([f"{k}:{v}" for k, v in by_severity.items()])
+            print(f"   按严重级别:         {sev_str}")
+        print()
+        print("📁 来源文件:")
+        print(f"   文件名:             {detail.get('filename', '')}")
+        print(f"   绝对路径:           {detail.get('source_file', '')}")
+        print(f"   文件哈希:           {detail.get('file_hash', '')[:16]}...")
+        print(f"   导入时声明:         {detail.get('event_count', 0)} 事件, {detail.get('error_count', 0)} 错误")
+        print(f"   实际匹配事件:       {detail.get('matched_event_count', 0)} 条")
+        print()
+        print("⏰ 时间线:")
+        if detail.get("imported_at"):
+            print(f"   导入时间:           {detail.get('imported_at', '')[:19].replace('T', ' ')}")
+        if detail.get("status") == "undone" and detail.get("undone_at"):
+            print(f"   撤销时间:           {detail.get('undone_at', '')[:19].replace('T', ' ')}")
+        if detail.get("restored_count", 0) > 0:
+            print(f"   恢复次数:           {detail.get('restored_count', 0)}")
+            if detail.get("last_restored_at"):
+                print(f"   最后恢复时间:       {detail.get('last_restored_at', '')[:19].replace('T', ' ')}")
+        print()
+        print("📝 最近一次处理结果:")
+        last_result = detail.get("last_processed_result")
+        if last_result:
+            result_icon = "✅ 成功" if last_result.get("result") == "success" else "❌ 失败"
+            print(f"   动作:               {last_result.get('action', '未知')}")
+            print(f"   结果:               {result_icon}")
+            print(f"   时间:               {last_result.get('timestamp', '')[:19].replace('T', ' ')}")
+            action_details = last_result.get("details", {})
+            if action_details:
+                for k, v in list(action_details.items())[:5]:
+                    if v:
+                        print(f"   {k:<20} {v}")
+        else:
+            print("   (暂无处理结果记录)")
+        print()
+
+        related_logs = detail.get("recent_related_logs", [])
+        if related_logs:
+            print("📜 最近相关日志:")
+            for log in related_logs[:5]:
+                sev_icon = {"info": "ℹ️", "warning": "⚠️", "error": "❌"}.get(log.get("severity", "info"), "  ")
+                ts = log.get("created_at", "")[:19].replace("T", " ")
+                print(f"   {sev_icon} [{ts}] {log.get('change_type', '')}")
+
+        print()
+
+    def _audit_undo_import(self, batch_id: str, display_index: int, force: bool) -> None:
+        resolved = self.store.resolve_import_by_display_index(batch_id, display_index)
+        if not resolved:
+            print(f"❌ 序号 {display_index} 对应的导入记录不存在", file=sys.stderr)
+            return
+
+        import_id = resolved.get("import_id")
+        status = resolved.get("status")
+        filename = resolved.get("filename", "")
+
+        print(f"📍 序号 {display_index} → 导入ID {import_id[:16]}...")
+        print(f"   文件: {filename}")
+        print(f"   当前状态: {status}")
+        print()
+
+        if status != "active":
+            print(f"❌ 该导入状态为「{status}」，无法撤销", file=sys.stderr)
+            self.store.log_change(batch_id, "audit_undo_invalid_status", {
+                "display_index": display_index,
+                "import_id": import_id,
+                "filename": filename,
+                "current_status": status,
+                "expected_status": "active",
+            }, severity="error")
+            sys.exit(1)
+
+        config = self.store.load_config(batch_id)
+        if config.audit_rules.check_import_conflict and not force:
+            events = self.store.load_events(batch_id)
+            bound_ids = set(resolved.get("event_ids", []))
+            has_dependencies = False
+            for e in events:
+                if e.id in bound_ids and len(e.import_ids) > 1:
+                    has_dependencies = True
+                    break
+            if has_dependencies:
+                print("⚠️  冲突检测: 该导入的部分事件被其他导入引用（去重合并）")
+                print("   撤销后这些事件将保留（孤儿保护机制）")
+                self.store.log_change(batch_id, "audit_undo_conflict_warning", {
+                    "display_index": display_index,
+                    "import_id": import_id,
+                    "filename": filename,
+                }, severity="warning")
+
+        print(f"↩️  正在撤销导入 (序号 {display_index}) ...")
+        result = self.store.undo_last_import(batch_id, import_id=import_id)
+        if not result:
+            print("❌ 撤销失败", file=sys.stderr)
+            return
+
+        removed = result.get("removed_event_count_actual", 0)
+        bound = len(result.get("event_ids", []))
+        orphans = len(result.get("orphaned_events_due_to_dedup", []))
+        round_num = result.get("round_number", "?")
+
+        print(f"✅ 已撤销导入: {filename} (轮次 {round_num})")
+        print(f"   导入时绑定事件数: {bound}")
+        print(f"   实际删除事件数:   {removed}")
+        if orphans > 0:
+            print(f"   因去重合并保留事件: {orphans} (这些事件还被其他导入引用)")
+        print(f"   删除解析错误数:   {result.get('removed_error_count_actual', 0)}")
+        real_events = len(self.store.load_events(batch_id))
+        print(f"   当前批次事件总数: {real_events}")
+
+        self.store.log_change(batch_id, "audit_undo_import_success", {
+            "display_index": display_index,
+            "import_id": import_id,
+            "filename": filename,
+            "removed_events": removed,
+        }, severity="info")
+
+    def _audit_restore_import(self, batch_id: str, display_index: int, force: bool) -> None:
+        resolved = self.store.resolve_import_by_display_index(batch_id, display_index)
+        if not resolved:
+            print(f"❌ 序号 {display_index} 对应的导入记录不存在", file=sys.stderr)
+            return
+
+        import_id = resolved.get("import_id")
+        status = resolved.get("status")
+        filename = resolved.get("filename", "")
+
+        print(f"📍 序号 {display_index} → 导入ID {import_id[:16]}...")
+        print(f"   文件: {filename}")
+        print(f"   当前状态: {status}")
+        print()
+
+        if status != "undone":
+            print(f"❌ 该导入状态为「{status}」，无需恢复", file=sys.stderr)
+            self.store.log_change(batch_id, "audit_restore_invalid_status", {
+                "display_index": display_index,
+                "import_id": import_id,
+                "filename": filename,
+                "current_status": status,
+                "expected_status": "undone",
+            }, severity="error")
+            sys.exit(1)
+
+        if not force:
+            conflict = self.store.check_duplicate_restore(batch_id, import_id)
+            if conflict.get("has_conflict"):
+                conflict_type = conflict.get("conflict_type", "unknown")
+                print(f"❌ 冲突检测失败: {conflict.get('message', '')}")
+                print(f"   冲突类型: {conflict_type}")
+                details = conflict.get("details", {})
+                if details:
+                    for k, v in details.items():
+                        if v:
+                            print(f"   {k}: {v}")
+                print()
+                print("💡 使用 --force 参数忽略冲突强制执行")
+                self.store.log_change(batch_id, "audit_restore_conflict_blocked", {
+                    "display_index": display_index,
+                    "import_id": import_id,
+                    "filename": filename,
+                    "conflict_type": conflict_type,
+                }, severity="warning")
+                sys.exit(1)
+
+        print(f"↪️  正在恢复导入 (序号 {display_index}) ...")
+        result = self.store.restore_import(batch_id, import_id=import_id)
+        if not result:
+            print("❌ 恢复失败", file=sys.stderr)
+            return
+
+        round_num = result.get("round_number", "?")
+        restore_count = result.get("restored_count", 1)
+        restored_events = result.get("restored_event_count", 0)
+        already_present = result.get("already_present_event_count", 0)
+
+        print(f"✅ 已恢复导入: {filename} (轮次 {round_num})")
+        print(f"   恢复次数累计:     {restore_count}")
+        print(f"   恢复关联事件数:   {restored_events}")
+        if already_present > 0:
+            print(f"   已存在于库中:     {already_present} (因后续导入或去重已存在)")
+        print(f"   恢复解析错误数:   {result.get('restored_error_count', 0)}")
+        real_events = len(self.store.load_events(batch_id))
+        print(f"   当前批次事件总数: {real_events}")
+
+        self.store.log_change(batch_id, "audit_restore_import_success", {
+            "display_index": display_index,
+            "import_id": import_id,
+            "filename": filename,
+            "restored_events": restored_events,
+        }, severity="info")
+
     def cmd_history(self, args) -> None:
         batch_id = self._require_batch()
 
@@ -2190,6 +2652,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_label_history.add_argument("--limit", "-n", type=int, help="显示最近的N条记录")
 
     p_undo_label = subparsers.add_parser("undo-label", help="撤销最后一次标注操作（状态/备注，与导入撤销独立）")
+
+    p_audit = subparsers.add_parser("audit-center", help="导入导出核对中心 - 完整链路管理")
+    p_audit.add_argument("--list", "-l", action="store_true", help="显示最近操作列表")
+    p_audit.add_argument("--detail", type=int, metavar="INDEX", help="按显示序号查看操作详情")
+    p_audit.add_argument("--undo", type=int, metavar="INDEX", help="按显示序号撤销导入")
+    p_audit.add_argument("--restore", type=int, metavar="INDEX", help="按显示序号恢复已撤销的导入")
+    p_audit.add_argument("--verify-export", type=str, metavar="FILE", help="核对指定导出文件与库内数据的一致性")
+    p_audit.add_argument("--export-audit", action="store_true", help="导出报告后自动核对")
+    p_audit.add_argument("--format", choices=["markdown", "csv"], default="markdown", help="导出格式")
+    p_audit.add_argument("--output", "-o", help="导出文件路径")
+    p_audit.add_argument("--limit", type=int, default=20, help="操作列表显示数量")
+    p_audit.add_argument("--show-rules", action="store_true", help="显示当前核对规则配置")
+    p_audit.add_argument("--enable-check", type=str, choices=["empty_export", "event_count_mismatch", "duplicate_restore", "import_conflict", "all"], help="启用指定核对规则")
+    p_audit.add_argument("--disable-check", type=str, choices=["empty_export", "event_count_mismatch", "duplicate_restore", "import_conflict", "all"], help="禁用指定核对规则")
+    p_audit.add_argument("--set-tolerance", type=str, metavar="CHECK=TOLERANCE", help="设置指定检查的容忍度，如 event_count_mismatch=5")
+    p_audit.add_argument("--force", "-f", action="store_true", help="忽略冲突强制执行操作")
 
     return parser
 

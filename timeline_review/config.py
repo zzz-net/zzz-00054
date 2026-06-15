@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from datetime import timedelta
 from .models import Severity, EventSource
 
@@ -13,6 +13,72 @@ DEFAULT_TIMESTAMP_FORMATS = [
     "%d/%b/%Y:%H:%M:%S %z",
     "%Y-%m-%d %H:%M:%S,%f",
 ]
+
+
+@dataclass
+class AuditRuleConfig:
+    enabled: bool = True
+    check_empty_export: bool = True
+    check_event_count_mismatch: bool = True
+    check_duplicate_restore: bool = True
+    check_import_conflict: bool = True
+    allow_force_reimport: bool = True
+    empty_export_tolerance: int = 0
+    count_mismatch_tolerance: int = 0
+    auto_fix_snapshot: bool = False
+    log_to_change_log: bool = True
+    log_level: str = "info"
+    export_count_patterns: List[str] = field(default_factory=lambda: [
+        "总事件数:",
+        "事件总数:",
+        "事件数:",
+        "event_count:",
+        "total_events:",
+    ])
+    additional_checks: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: Dict) -> "AuditRuleConfig":
+        return cls(
+            enabled=d.get("enabled", True),
+            check_empty_export=d.get("check_empty_export", True),
+            check_event_count_mismatch=d.get("check_event_count_mismatch", True),
+            check_duplicate_restore=d.get("check_duplicate_restore", True),
+            check_import_conflict=d.get("check_import_conflict", True),
+            allow_force_reimport=d.get("allow_force_reimport", True),
+            empty_export_tolerance=d.get("empty_export_tolerance", 0),
+            count_mismatch_tolerance=d.get("count_mismatch_tolerance", 0),
+            auto_fix_snapshot=d.get("auto_fix_snapshot", False),
+            log_to_change_log=d.get("log_to_change_log", True),
+            log_level=d.get("log_level", "info"),
+            export_count_patterns=d.get("export_count_patterns", [
+                "总事件数:",
+                "事件总数:",
+                "事件数:",
+                "event_count:",
+                "total_events:",
+            ]),
+            additional_checks=d.get("additional_checks", {}),
+        )
+
+    def is_check_enabled(self, check_name: str) -> bool:
+        check_map = {
+            "empty_export": self.check_empty_export,
+            "event_count_mismatch": self.check_event_count_mismatch,
+            "duplicate_restore": self.check_duplicate_restore,
+            "import_conflict": self.check_import_conflict,
+        }
+        return check_map.get(check_name, False)
+
+    def get_tolerance(self, check_name: str) -> int:
+        tol_map = {
+            "empty_export": self.empty_export_tolerance,
+            "event_count_mismatch": self.count_mismatch_tolerance,
+        }
+        return tol_map.get(check_name, 0)
 
 
 @dataclass
@@ -59,11 +125,13 @@ class RuleConfig:
     csv_time_column: str = "timestamp"
     csv_message_column: str = "message"
     csv_severity_column: str = "severity"
+    audit_rules: AuditRuleConfig = field(default_factory=AuditRuleConfig)
 
     def to_dict(self) -> Dict:
         d = asdict(self)
         d["severity_mapping"] = {k: v.value for k, v in self.severity_mapping.items()}
         d["source_priority"] = {k.value: v for k, v in self.source_priority.items()}
+        d["audit_rules"] = self.audit_rules.to_dict()
         return d
 
     @classmethod
@@ -74,6 +142,7 @@ class RuleConfig:
         src_pri = {}
         for k, v in d.get("source_priority", {}).items():
             src_pri[EventSource(k)] = v
+        audit_rules = AuditRuleConfig.from_dict(d.get("audit_rules", {})) if d.get("audit_rules") else AuditRuleConfig()
         return cls(
             rule_version=d.get("rule_version", "1.0.0"),
             dedup_window_seconds=d.get("dedup_window_seconds", 300),
@@ -88,6 +157,7 @@ class RuleConfig:
             csv_time_column=d.get("csv_time_column", "timestamp"),
             csv_message_column=d.get("csv_message_column", "message"),
             csv_severity_column=d.get("csv_severity_column", "severity"),
+            audit_rules=audit_rules,
         )
 
     def get_dedup_timedelta(self) -> timedelta:

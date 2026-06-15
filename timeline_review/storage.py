@@ -528,63 +528,314 @@ class StateStore:
             "consistent": True,
             "checks": [],
             "mismatches": [],
+            "audit_rules_applied": [],
+            "failed_checks": [],
         }
         try:
+            config = self.load_config(batch_id)
+            audit_rules = config.audit_rules
+            result["audit_rules_enabled"] = audit_rules.enabled
+
+            if not audit_rules.enabled:
+                result["checks"].append("核对规则已禁用，跳过校验")
+                result["consistent"] = True
+                return result
+
             real_events = self.load_events(batch_id)
             real_count = len(real_events)
-            result["checks"].append(f"实际事件数: {real_count}")
+            valid_events = [e for e in real_events if e.status.value != "噪声"]
+            valid_count = len(valid_events)
+            result["checks"].append(f"实际事件总数: {real_count}")
+            result["checks"].append(f"库内有效事件数(非噪声): {valid_count}")
+            result["actual_total_count"] = real_count
+            result["actual_valid_count"] = valid_count
 
             count_in_export = 0
             if export_format == "markdown":
+                import re
+                patterns = audit_rules.export_count_patterns
                 for line in export_content.splitlines():
-                    if "事件总数:" in line or "事件数:" in line:
-                        for part in line.split():
-                            try:
-                                n = int(part.strip())
-                                if n > 0 and n < 100000:
+                    found = False
+                    for pattern in patterns:
+                        pattern_clean = pattern.replace(":", "")
+                        if pattern_clean in line:
+                            match = re.search(r'(\d+)', line)
+                            if match:
+                                n = int(match.group(1))
+                                if n >= 0 and n < 1000000:
                                     count_in_export = n
+                                    found = True
                                     break
-                            except ValueError:
-                                pass
+                    if found:
+                        break
             elif export_format == "csv":
                 csv_lines = [l for l in export_content.splitlines() if l.strip()]
                 if csv_lines:
                     count_in_export = max(0, len(csv_lines) - 1)
 
             result["checks"].append(f"导出文件中事件数: {count_in_export}")
-            if count_in_export == 0 and real_count > 0:
-                result["consistent"] = False
-                result["mismatches"].append({
-                    "field": "event_count",
-                    "export": 0,
-                    "actual": real_count,
-                    "diff": real_count,
-                    "reason": "导出文件中事件数为0，但实际存在事件",
-                })
-            elif count_in_export > 0 and count_in_export != real_count:
-                result["consistent"] = False
-                result["mismatches"].append({
-                    "field": "event_count",
-                    "export": count_in_export,
-                    "actual": real_count,
-                    "diff": real_count - count_in_export,
-                    "reason": "导出文件事件数与实际不一致",
-                })
+            result["export_count"] = count_in_export
+
+            if audit_rules.is_check_enabled("empty_export"):
+                result["audit_rules_applied"].append("empty_export")
+                tolerance = audit_rules.get_tolerance("empty_export")
+                if count_in_export <= tolerance and valid_count > tolerance:
+                    result["consistent"] = False
+                    mismatch = {
+                        "field": "event_count",
+                        "check_type": "empty_export",
+                        "export": count_in_export,
+                        "actual": valid_count,
+                        "diff": valid_count - count_in_export,
+                        "reason": f"空导出校验失败: 导出事件数为{count_in_export}(容忍度:{tolerance})，但库内有效事件数为{valid_count}",
+                        "severity": "error",
+                    }
+                    result["mismatches"].append(mismatch)
+                    result["failed_checks"].append("empty_export")
+                    if audit_rules.log_to_change_log:
+                        self.log_change(batch_id, "audit_empty_export_failed", mismatch,
+                                      severity="error" if audit_rules.log_level == "info" else audit_rules.log_level)
+
+            if audit_rules.is_check_enabled("event_count_mismatch") and result["consistent"]:
+                result["audit_rules_applied"].append("event_count_mismatch")
+                tolerance = audit_rules.get_tolerance("event_count_mismatch")
+                diff = abs(valid_count - count_in_export)
+                if count_in_export > 0 and diff > tolerance:
+                    result["consistent"] = False
+                    mismatch = {
+                        "field": "event_count",
+                        "check_type": "event_count_mismatch",
+                        "export": count_in_export,
+                        "actual": valid_count,
+                        "diff": valid_count - count_in_export,
+                        "abs_diff": diff,
+                        "tolerance": tolerance,
+                        "reason": f"数量不一致校验失败: 导出{count_in_export}条，实际{valid_count}条，差异{diff}条(容忍度:{tolerance})",
+                        "severity": "error",
+                    }
+                    result["mismatches"].append(mismatch)
+                    result["failed_checks"].append("event_count_mismatch")
+                    if audit_rules.log_to_change_log:
+                        self.log_change(batch_id, "audit_count_mismatch_failed", mismatch,
+                                      severity="error" if audit_rules.log_level == "info" else audit_rules.log_level)
 
             consistency = self.check_snapshot_consistency(batch_id)
             if not consistency.get("consistent"):
-                result["consistent"] = False
-                result["mismatches"].append({
-                    "type": "snapshot_inconsistent",
-                    "details": consistency.get("inconsistencies", []),
-                })
+                if audit_rules.auto_fix_snapshot:
+                    self.log_change(batch_id, "audit_auto_fixing_snapshot", consistency, severity="warning")
+                    fix_result = self.fix_snapshot_inconsistencies(batch_id)
+                    result["checks"].append(f"自动修复快照: {fix_result.get('fixed', False)}")
+                    consistency = self.check_snapshot_consistency(batch_id)
 
-            self.log_change(batch_id, "export_consistency_verified", result,
-                          severity="info" if result["consistent"] else "warning")
+                if not consistency.get("consistent"):
+                    result["consistent"] = False
+                    mismatch = {
+                        "type": "snapshot_inconsistent",
+                        "check_type": "snapshot_integrity",
+                        "details": consistency.get("inconsistencies", []),
+                        "reason": "快照与真实数据不一致",
+                        "severity": "warning",
+                    }
+                    result["mismatches"].append(mismatch)
+                    result["failed_checks"].append("snapshot_integrity")
+                    if audit_rules.log_to_change_log:
+                        self.log_change(batch_id, "audit_snapshot_inconsistent", mismatch, severity="warning")
+
+            if result["consistent"]:
+                result["checks"].append("✅ 所有核对规则通过")
+                if audit_rules.log_to_change_log:
+                    self.log_change(batch_id, "export_consistency_verified", {
+                        "result": "passed",
+                        "export_count": count_in_export,
+                        "actual_valid_count": valid_count,
+                        "rules_applied": result["audit_rules_applied"],
+                    }, severity="info")
+            else:
+                result["checks"].append(f"❌ {len(result['failed_checks'])} 项核对规则未通过")
+                if audit_rules.log_to_change_log:
+                    self.log_change(batch_id, "export_consistency_failed", {
+                        "result": "failed",
+                        "export_count": count_in_export,
+                        "actual_valid_count": valid_count,
+                        "failed_checks": result["failed_checks"],
+                        "mismatches": result["mismatches"],
+                    }, severity="error")
         except Exception as e:
             result["consistent"] = False
             result["checks"].append(f"校验异常: {e}")
+            result["failed_checks"].append("exception")
+            import traceback
+            self.log_change(batch_id, "audit_verification_exception", {
+                "error": str(e),
+                "traceback": traceback.format_exc(),
+            }, severity="error")
         return result
+
+    def check_duplicate_restore(self, batch_id: str, import_id: str) -> Dict:
+        result = {
+            "has_conflict": False,
+            "conflict_type": None,
+            "message": "",
+            "details": {},
+        }
+        try:
+            config = self.load_config(batch_id)
+            audit_rules = config.audit_rules
+
+            if not audit_rules.check_duplicate_restore:
+                return result
+
+            index = self._read_imports_index(batch_id)
+            target_entry = None
+            for entry in index:
+                if entry.get("import_id") == import_id:
+                    target_entry = entry
+                    break
+
+            if not target_entry:
+                result["message"] = "导入记录不存在"
+                return result
+
+            if target_entry.get("status") == "active":
+                result["has_conflict"] = True
+                result["conflict_type"] = "already_active"
+                result["message"] = "该导入已处于激活状态，无需重复恢复"
+                result["details"] = {
+                    "import_id": import_id,
+                    "filename": target_entry.get("filename"),
+                    "current_status": target_entry.get("status"),
+                    "restored_count": target_entry.get("restored_count", 0),
+                }
+                if audit_rules.log_to_change_log:
+                    self.log_change(batch_id, "audit_duplicate_restore_detected", result["details"], severity="error")
+
+            abs_path = target_entry.get("abs_path")
+            file_hash = target_entry.get("file_hash")
+            for entry in index:
+                if entry.get("import_id") != import_id and entry.get("status") == "active":
+                    if entry.get("abs_path") == abs_path or entry.get("file_hash") == file_hash:
+                        result["has_conflict"] = True
+                        result["conflict_type"] = "duplicate_file_active"
+                        result["message"] = "存在另一个相同文件的激活导入记录，恢复会导致重复数据"
+                        result["details"] = {
+                            "import_id": import_id,
+                            "filename": target_entry.get("filename"),
+                            "conflicting_import_id": entry.get("import_id"),
+                            "conflicting_imported_at": entry.get("imported_at"),
+                        }
+                        if audit_rules.log_to_change_log:
+                            self.log_change(batch_id, "audit_restore_conflict_detected", result["details"], severity="error")
+                        break
+
+        except Exception as e:
+            result["has_conflict"] = True
+            result["conflict_type"] = "error"
+            result["message"] = f"冲突检查异常: {e}"
+            self.log_change(batch_id, "audit_conflict_check_error", {"error": str(e)}, severity="error")
+
+        return result
+
+    def get_audit_operations_list(self, batch_id: str, limit: int = 20) -> List[Dict]:
+        all_entries = self.get_all_imports_with_index(batch_id)
+        operations = []
+
+        for entry in all_entries:
+            import_id = entry.get("import_id", "")
+            last_processed_at = entry.get("last_restored_at") or entry.get("undone_at") or entry.get("imported_at", "")
+            status = entry.get("status", "unknown")
+            event_count = entry.get("event_count", 0)
+            matched_events = 0
+            try:
+                detail = self.get_import_detail(batch_id, import_id=import_id)
+                if detail:
+                    matched_events = detail.get("matched_event_count", 0)
+            except Exception:
+                pass
+
+            operations.append({
+                "display_index": entry.get("display_index", 0),
+                "import_id": import_id,
+                "filename": entry.get("filename", ""),
+                "abs_path": entry.get("abs_path", ""),
+                "file_hash": entry.get("file_hash", "")[:16] if entry.get("file_hash") else "",
+                "round_number": entry.get("round_number", 0),
+                "status": status,
+                "event_count": event_count,
+                "matched_event_count": matched_events,
+                "error_count": entry.get("error_count", 0),
+                "imported_at": entry.get("imported_at", ""),
+                "undone_at": entry.get("undone_at", ""),
+                "last_restored_at": entry.get("last_restored_at", ""),
+                "restored_count": entry.get("restored_count", 0),
+                "last_processed_at": last_processed_at,
+                "operation_type": self._get_operation_type(status, entry),
+            })
+
+        operations.sort(key=lambda x: x.get("last_processed_at", ""), reverse=True)
+        return operations[:limit]
+
+    def _get_operation_type(self, status: str, entry: Dict) -> str:
+        if status == "undone":
+            if entry.get("restored_count", 0) > 0:
+                return "已撤销(曾恢复)"
+            return "已撤销"
+        elif status == "active":
+            if entry.get("restored_count", 0) > 0:
+                return "已恢复"
+            return "已导入"
+        return "未知"
+
+    def get_audit_operation_detail(self, batch_id: str, display_index: int) -> Optional[Dict]:
+        resolved = self.resolve_import_by_display_index(batch_id, display_index)
+        if not resolved:
+            return None
+
+        import_id = resolved.get("import_id")
+        detail = self.get_import_detail(batch_id, import_id=import_id)
+        if not detail:
+            return None
+
+        events = self.load_events(batch_id)
+        bound_ids = set(detail.get("event_ids", []))
+        event_stats = {
+            "total": 0,
+            "by_status": {},
+            "by_severity": {},
+        }
+
+        for e in events:
+            if e.id in bound_ids or import_id in e.import_ids:
+                event_stats["total"] += 1
+                status_val = e.status.value
+                event_stats["by_status"][status_val] = event_stats["by_status"].get(status_val, 0) + 1
+                sev_val = e.severity.value
+                event_stats["by_severity"][sev_val] = event_stats["by_severity"].get(sev_val, 0) + 1
+
+        change_log = self.get_change_log(batch_id, limit=10, change_type="import_change")
+        related_logs = [
+            log for log in change_log
+            if log.get("detail", {}).get("import_id") == import_id
+            or log.get("detail", {}).get("filename") == detail.get("filename")
+        ]
+
+        last_processed_result = None
+        if related_logs:
+            last_log = related_logs[0]
+            last_processed_result = {
+                "action": last_log.get("change_type", ""),
+                "result": "success" if last_log.get("severity") != "error" else "failed",
+                "timestamp": last_log.get("created_at", ""),
+                "details": last_log.get("detail", {}),
+            }
+
+        return {
+            **detail,
+            "display_index": display_index,
+            "event_stats": event_stats,
+            "source_file": detail.get("abs_path", ""),
+            "last_processed_result": last_processed_result,
+            "recent_related_logs": related_logs,
+        }
 
     def get_import_detail(self, batch_id: str, import_id: str = None,
                            round_number: int = None) -> Optional[Dict]:
