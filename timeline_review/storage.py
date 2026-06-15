@@ -275,18 +275,54 @@ class StateStore:
         with open(self._import_index_map_path(batch_id), "w", encoding="utf-8") as f:
             json.dump(mapping, f, ensure_ascii=False, indent=2)
 
+    def _refresh_import_index_map(self, batch_id: str, index: List[Dict] = None) -> Dict:
+        if index is None:
+            index = self._read_imports_index(batch_id)
+        mapping = {}
+        needs_write_back = False
+        used_indices = set()
+        for entry in index:
+            didx = entry.get("display_index", 0)
+            if didx and didx not in used_indices:
+                mapping[str(didx)] = entry.get("import_id", "")
+                used_indices.add(didx)
+            else:
+                needs_write_back = True
+        if needs_write_back:
+            next_idx = 1
+            for entry in index:
+                didx = entry.get("display_index", 0)
+                if not didx or didx in used_indices:
+                    while next_idx in used_indices:
+                        next_idx += 1
+                    entry["display_index"] = next_idx
+                    mapping[str(next_idx)] = entry.get("import_id", "")
+                    used_indices.add(next_idx)
+                    next_idx += 1
+            self._write_imports_index(batch_id, index)
+        self._write_import_index_map(batch_id, mapping)
+        return mapping
+
     def get_all_imports_with_index(self, batch_id: str) -> List[Dict]:
         all_entries = self._read_imports_index(batch_id)
-        old_map = self._read_import_index_map(batch_id)
-        new_map = {}
-        for i, entry in enumerate(all_entries, 1):
+        self._refresh_import_index_map(batch_id, all_entries)
+        events = self.load_events(batch_id)
+        event_map = {e.id: e for e in events}
+        for entry in all_entries:
+            bound_ids = set(entry.get("event_ids", []))
             import_id = entry.get("import_id", "")
-            new_map[str(i)] = import_id
-            entry["display_index"] = i
-        self._write_import_index_map(batch_id, new_map)
+            matched = 0
+            for eid in bound_ids:
+                if eid in event_map and (import_id in event_map[eid].import_ids or len(event_map[eid].import_ids) == 0):
+                    matched += 1
+            for e in events:
+                if import_id in e.import_ids and e.id not in bound_ids:
+                    matched += 1
+            entry["matched_event_count"] = matched
+        self._write_imports_index(batch_id, all_entries)
         self.log_change(batch_id, "import_index_map_refreshed", {
             "total_entries": len(all_entries),
-            "mapped_indices": len(new_map),
+            "mapped_indices": len([e for e in all_entries if e.get("display_index")]),
         }, severity="debug")
         return all_entries
 
@@ -499,12 +535,47 @@ class StateStore:
             index = self._read_imports_index(batch_id)
             repaired = 0
             for entry in index:
+                needs_repair = False
                 if "status" not in entry:
                     entry["status"] = "active"
-                    entry.setdefault("import_id", self._generate_import_id())
-                    entry.setdefault("round_number", 0)
-                    entry.setdefault("event_ids", [])
-                    entry.setdefault("parse_error_refs", [])
+                    needs_repair = True
+                entry.setdefault("import_id", self._generate_import_id())
+                entry.setdefault("round_number", 0)
+                entry.setdefault("event_ids", [])
+                entry.setdefault("parse_error_refs", [])
+                entry.setdefault("undone_at", None)
+                entry.setdefault("last_restored_at", None)
+                entry.setdefault("restored_count", 0)
+                entry.setdefault("display_index", 0)
+                if "matched_event_count" not in entry:
+                    entry["matched_event_count"] = entry.get("event_count", 0)
+                    needs_repair = True
+                if "last_operation" not in entry:
+                    if entry.get("status") == "undone":
+                        entry["last_operation"] = "undo"
+                    elif entry.get("restored_count", 0) > 0:
+                        entry["last_operation"] = "restore"
+                    else:
+                        entry["last_operation"] = "import"
+                    needs_repair = True
+                if "last_operation_at" not in entry:
+                    entry["last_operation_at"] = (
+                        entry.get("last_restored_at")
+                        or entry.get("undone_at")
+                        or entry.get("imported_at", "")
+                    )
+                    needs_repair = True
+                if "last_operation_result" not in entry:
+                    entry["last_operation_result"] = "success"
+                    needs_repair = True
+                if "last_operation_detail" not in entry:
+                    entry["last_operation_detail"] = {
+                        "action": entry["last_operation"],
+                        "event_count": entry.get("event_count", 0),
+                        "round_number": entry.get("round_number", 0),
+                    }
+                    needs_repair = True
+                if needs_repair:
                     repaired += 1
             if repaired:
                 self._write_imports_index(batch_id, index)
@@ -512,8 +583,9 @@ class StateStore:
                 result["rebuilt"] = True
 
             try:
+                mapping = self._refresh_import_index_map(batch_id, index)
+                result["actions"].append(f"已重建导入显示索引映射({len(mapping)}条)")
                 self.get_all_imports_with_index(batch_id)
-                result["actions"].append("已重建导入显示索引映射")
             except Exception as e:
                 result["errors"].append(f"重建导入索引映射失败: {e}")
 
@@ -741,16 +813,15 @@ class StateStore:
 
         for entry in all_entries:
             import_id = entry.get("import_id", "")
-            last_processed_at = entry.get("last_restored_at") or entry.get("undone_at") or entry.get("imported_at", "")
             status = entry.get("status", "unknown")
-            event_count = entry.get("event_count", 0)
-            matched_events = 0
-            try:
-                detail = self.get_import_detail(batch_id, import_id=import_id)
-                if detail:
-                    matched_events = detail.get("matched_event_count", 0)
-            except Exception:
-                pass
+            last_op = entry.get("last_operation", "")
+            last_op_at = entry.get("last_operation_at", "")
+            last_processed_at = (
+                entry.get("last_restored_at")
+                or entry.get("undone_at")
+                or entry.get("imported_at", "")
+                or last_op_at
+            )
 
             operations.append({
                 "display_index": entry.get("display_index", 0),
@@ -760,8 +831,8 @@ class StateStore:
                 "file_hash": entry.get("file_hash", "")[:16] if entry.get("file_hash") else "",
                 "round_number": entry.get("round_number", 0),
                 "status": status,
-                "event_count": event_count,
-                "matched_event_count": matched_events,
+                "event_count": entry.get("event_count", 0),
+                "matched_event_count": entry.get("matched_event_count", 0),
                 "error_count": entry.get("error_count", 0),
                 "imported_at": entry.get("imported_at", ""),
                 "undone_at": entry.get("undone_at", ""),
@@ -769,12 +840,24 @@ class StateStore:
                 "restored_count": entry.get("restored_count", 0),
                 "last_processed_at": last_processed_at,
                 "operation_type": self._get_operation_type(status, entry),
+                "last_operation": last_op,
+                "last_operation_at": last_op_at,
+                "last_operation_result": entry.get("last_operation_result", ""),
             })
 
         operations.sort(key=lambda x: x.get("last_processed_at", ""), reverse=True)
         return operations[:limit]
 
     def _get_operation_type(self, status: str, entry: Dict) -> str:
+        last_op = entry.get("last_operation", "")
+        if last_op == "import":
+            return "已导入"
+        elif last_op == "undo":
+            if entry.get("restored_count", 0) > 0:
+                return "已撤销(曾恢复)"
+            return "已撤销"
+        elif last_op == "restore":
+            return "已恢复"
         if status == "undone":
             if entry.get("restored_count", 0) > 0:
                 return "已撤销(曾恢复)"
@@ -820,8 +903,27 @@ class StateStore:
                     or log_detail.get("display_index") == display_index):
                 related_logs.append(log)
 
+        last_op = resolved.get("last_operation", "")
+        last_op_at = resolved.get("last_operation_at", "")
+        last_op_result = resolved.get("last_operation_result", "")
+        last_op_detail = resolved.get("last_operation_detail", {})
+
+        action_display_map = {
+            "import": "导入",
+            "undo": "撤销",
+            "restore": "恢复",
+        }
+
         last_processed_result = None
-        if related_logs:
+        if last_op:
+            last_processed_result = {
+                "action": last_op,
+                "action_display": action_display_map.get(last_op, last_op),
+                "result": last_op_result if last_op_result else "success",
+                "timestamp": last_op_at,
+                "details": last_op_detail,
+            }
+        elif related_logs:
             last_log = related_logs[0]
             action_type_map = {
                 "import_registered": "导入",
@@ -849,7 +951,7 @@ class StateStore:
 
         operation_type = self._get_operation_type(
             detail.get("status", "unknown"),
-            detail
+            resolved
         )
 
         return {
@@ -933,6 +1035,7 @@ class StateStore:
             round_number = self._get_next_round_number(batch_id) - 1
             if round_number < 1:
                 round_number = 1
+        now_iso = datetime.now().isoformat()
         entry = {
             "import_id": import_id,
             "abs_path": abs_path,
@@ -942,20 +1045,39 @@ class StateStore:
             "error_count": error_count,
             "event_ids": list(event_ids) if event_ids else [],
             "parse_error_refs": list(parse_error_refs) if parse_error_refs else [],
-            "imported_at": datetime.now().isoformat(),
+            "imported_at": now_iso,
             "round_number": round_number,
             "status": "active",
             "undone_at": None,
+            "last_restored_at": None,
             "restored_count": 0,
+            "display_index": 0,
+            "matched_event_count": event_count,
+            "last_operation": "import",
+            "last_operation_at": now_iso,
+            "last_operation_result": "success",
+            "last_operation_detail": {
+                "action": "import",
+                "event_count": event_count,
+                "error_count": error_count,
+                "round_number": round_number,
+            },
         }
         index = self._read_imports_index(batch_id)
+        next_disp_idx = 1
+        for existing in index:
+            if existing.get("display_index", 0) >= next_disp_idx:
+                next_disp_idx = existing["display_index"] + 1
+        entry["display_index"] = next_disp_idx
         index.append(entry)
         self._write_imports_index(batch_id, index)
+        self._refresh_import_index_map(batch_id, index)
         self.log_change(batch_id, "import_registered", {
             "import_id": import_id,
             "filename": entry["filename"],
             "event_count": event_count,
             "round_number": round_number,
+            "display_index": next_disp_idx,
         }, severity="info")
         try:
             self.refresh_overview_snapshot(batch_id, trigger="import")
@@ -1132,13 +1254,27 @@ class StateStore:
         with open(self._parse_errors_path(batch_id), "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
+        now_iso = datetime.now().isoformat()
         index[target_idx]["status"] = "undone"
-        index[target_idx]["undone_at"] = datetime.now().isoformat()
+        index[target_idx]["undone_at"] = now_iso
         index[target_idx]["removed_event_count_actual"] = removed_event_count
         index[target_idx]["removed_error_count_actual"] = removed_error_count
         index[target_idx]["orphaned_events_due_to_dedup"] = list(orphaned_map)
         index[target_idx]["removed_events_snapshot"] = removed_events_snapshot
+        index[target_idx]["last_operation"] = "undo"
+        index[target_idx]["last_operation_at"] = now_iso
+        index[target_idx]["last_operation_result"] = "success"
+        index[target_idx]["last_operation_detail"] = {
+            "action": "undo",
+            "removed_event_count": removed_event_count,
+            "removed_error_count": removed_error_count,
+            "bound_event_count": len(bound_event_ids),
+            "orphaned_count": len(orphaned_map),
+            "round_number": removed_round,
+        }
+        index[target_idx]["matched_event_count"] = 0
         self._write_imports_index(batch_id, index)
+        self._refresh_import_index_map(batch_id, index)
 
         source_type = self._infer_source_type(removed_filename)
         undo_detail = {
@@ -1279,12 +1415,28 @@ class StateStore:
         with open(self._parse_errors_path(batch_id), "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
+        now_iso = datetime.now().isoformat()
+        new_restored_count = index[target_idx].get("restored_count", 0) + 1
         index[target_idx]["status"] = "active"
         index[target_idx]["undone_at"] = None
-        index[target_idx]["restored_count"] = index[target_idx].get("restored_count", 0) + 1
-        index[target_idx]["last_restored_at"] = datetime.now().isoformat()
+        index[target_idx]["restored_count"] = new_restored_count
+        index[target_idx]["last_restored_at"] = now_iso
+        index[target_idx]["last_operation"] = "restore"
+        index[target_idx]["last_operation_at"] = now_iso
+        index[target_idx]["last_operation_result"] = "success"
+        index[target_idx]["last_operation_detail"] = {
+            "action": "restore",
+            "restored_event_count": restored_event_count,
+            "restored_error_count": restored_error_count,
+            "recreated_event_count": recreated_count,
+            "already_present_event_count": already_present_count,
+            "restore_count_total": new_restored_count,
+            "round_number": restore_round,
+        }
+        index[target_idx]["matched_event_count"] = restored_event_count
+        index[target_idx]["restored_event_count"] = restored_event_count
         self._write_imports_index(batch_id, index)
-        self.get_all_imports_with_index(batch_id)
+        self._refresh_import_index_map(batch_id, index)
         self.update_batch_meta(batch_id, event_count=len(self.load_events(batch_id)))
 
         source_type = self._infer_source_type(restore_filename)
