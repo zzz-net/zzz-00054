@@ -63,6 +63,9 @@ class StateStore:
     def _overview_snapshot_path(self, batch_id: str) -> Path:
         return self._get_batch_dir(batch_id) / "overview_snapshot.json"
 
+    def _undo_history_path(self, batch_id: str) -> Path:
+        return self._get_batch_dir(batch_id) / "undo_history.json"
+
     def _active_batch_path(self) -> Path:
         return self.storage_dir / "active_batch.json"
 
@@ -102,6 +105,7 @@ class StateStore:
         self.save_parse_errors(batch_id, [])
         self._write_imports_index(batch_id, [])
         self._write_label_history(batch_id, [])
+        self._write_undo_history(batch_id, [])
         self._set_active_batch(batch_id)
         self.refresh_overview_snapshot(batch_id)
         return meta
@@ -223,6 +227,35 @@ class StateStore:
         with open(self._label_history_path(batch_id), "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
+    def _read_undo_history(self, batch_id: str) -> List[Dict]:
+        path = self._undo_history_path(batch_id)
+        if not path.exists():
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return []
+
+    def _write_undo_history(self, batch_id: str, history: List[Dict]) -> None:
+        self._ensure_batch_dir(batch_id)
+        with open(self._undo_history_path(batch_id), "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+
+    def _record_undo(self, batch_id: str, undo_type: str, detail: Dict) -> None:
+        history = self._read_undo_history(batch_id)
+        entry = {
+            "id": str(uuid.uuid4())[:8],
+            "undo_type": undo_type,
+            "detail": detail,
+            "created_at": datetime.now().isoformat(),
+        }
+        history.append(entry)
+        self._write_undo_history(batch_id, history)
+
+    def get_undo_history(self, batch_id: str) -> List[Dict]:
+        return self._read_undo_history(batch_id)
+
     def _record_label_change(self, batch_id: str, event_id: str, operation: str,
                              old_status: Optional[EventStatus] = None,
                              new_status: Optional[EventStatus] = None,
@@ -301,6 +334,27 @@ class StateStore:
         if updates:
             self.update_event(batch_id, last.event_id, **updates)
         self._write_label_history(batch_id, history)
+        try:
+            op_desc = {
+                "set_status": f"修改状态({last.old_status.value if last.old_status else '无'}→{last.new_status.value if last.new_status else '无'})",
+                "set_notes": "修改备注",
+                "set_both": "修改状态+备注",
+            }.get(last.operation, last.operation)
+            self._record_undo(batch_id, "undo_label", {
+                "event_id": last.event_id,
+                "event_id_short": last.event_id[:12] + "..." if len(last.event_id) > 12 else last.event_id,
+                "operation_description": op_desc,
+                "operation_raw": last.operation,
+                "old_status": last.old_status.value if last.old_status else None,
+                "new_status": last.new_status.value if last.new_status else None,
+                "restored_status": last.old_status.value if last.old_status else None,
+                "old_notes_preview": (last.old_notes[:40] + "...") if last.old_notes and len(last.old_notes) > 40 else (last.old_notes or ""),
+                "new_notes_preview": (last.new_notes[:40] + "...") if last.new_notes and len(last.new_notes) > 40 else (last.new_notes or ""),
+                "config_version": last.config_version,
+                "original_acted_at": last.created_at.isoformat(),
+            })
+        except Exception:
+            pass
         try:
             self.refresh_overview_snapshot(batch_id)
         except Exception:
@@ -386,6 +440,56 @@ class StateStore:
             return None
         last = index.pop()
         self._write_imports_index(batch_id, index)
+        removed_filename = last.get("filename", "")
+        removed_abs_path = last.get("abs_path", "")
+        removed_event_count = 0
+        removed_error_count = 0
+        try:
+            events = self.load_events(batch_id)
+            kept_events = []
+            for e in events:
+                if e.source_file == removed_filename or e.source_file == removed_abs_path:
+                    removed_event_count += 1
+                else:
+                    kept_events.append(e)
+            if removed_event_count > 0 or len(kept_events) != len(events):
+                data = [e.to_dict() for e in kept_events]
+                self._ensure_batch_dir(batch_id)
+                with open(self._events_path(batch_id), "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                self.update_batch_meta(batch_id, event_count=len(kept_events))
+        except Exception:
+            pass
+        try:
+            errors = self.load_parse_errors(batch_id)
+            kept_errors = []
+            for err in errors:
+                if err.source_file == removed_filename or err.source_file == removed_abs_path:
+                    removed_error_count += 1
+                else:
+                    kept_errors.append(err)
+            if removed_error_count > 0 or len(kept_errors) != len(errors):
+                data = [e.to_dict() for e in kept_errors]
+                self._ensure_batch_dir(batch_id)
+                with open(self._parse_errors_path(batch_id), "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        try:
+            source_type = self._infer_source_type(removed_filename)
+            self._record_undo(batch_id, "undo_import", {
+                "filename": removed_filename,
+                "abs_path": removed_abs_path,
+                "source_type": source_type,
+                "file_hash": last.get("file_hash", "")[:16] if last.get("file_hash") else "",
+                "imported_at": last.get("imported_at", ""),
+                "imported_event_count": last.get("event_count", 0),
+                "imported_error_count": last.get("error_count", 0),
+                "removed_event_count": removed_event_count,
+                "removed_error_count": removed_error_count,
+            })
+        except Exception:
+            pass
         try:
             self.refresh_overview_snapshot(batch_id)
         except Exception:
@@ -546,6 +650,64 @@ class StateStore:
             snapshot["label_action_count"] = 0
             snapshot["last_label_action"] = None
             snapshot["_label_history_error"] = str(e)
+
+        try:
+            undo_history = self.get_undo_history(batch_id)
+            snapshot["undo_action_count"] = len(undo_history)
+            if undo_history:
+                last_undo = undo_history[-1]
+                undo_type = last_undo.get("undo_type", "")
+                detail = last_undo.get("detail", {})
+                if undo_type == "undo_label":
+                    snapshot["last_undo_action"] = {
+                        "undo_type": "undo_label",
+                        "undo_type_desc": "撤销标注",
+                        **detail,
+                        "acted_at": last_undo.get("created_at", ""),
+                    }
+                elif undo_type == "undo_import":
+                    snapshot["last_undo_action"] = {
+                        "undo_type": "undo_import",
+                        "undo_type_desc": "撤销导入",
+                        **detail,
+                        "acted_at": last_undo.get("created_at", ""),
+                    }
+                else:
+                    snapshot["last_undo_action"] = {
+                        "undo_type": undo_type,
+                        "undo_type_desc": f"撤销({undo_type})",
+                        **detail,
+                        "acted_at": last_undo.get("created_at", ""),
+                    }
+            else:
+                snapshot["last_undo_action"] = None
+        except Exception as e:
+            snapshot["undo_action_count"] = 0
+            snapshot["last_undo_action"] = None
+            snapshot["_undo_history_error"] = str(e)
+
+        label_time = ""
+        if snapshot.get("last_label_action"):
+            label_time = snapshot["last_label_action"].get("acted_at", "")
+        undo_time = ""
+        if snapshot.get("last_undo_action"):
+            undo_time = snapshot["last_undo_action"].get("acted_at", "")
+        if label_time and undo_time:
+            if undo_time >= label_time:
+                snapshot["latest_action_kind"] = "undo"
+                snapshot["latest_action"] = snapshot["last_undo_action"]
+            else:
+                snapshot["latest_action_kind"] = "label"
+                snapshot["latest_action"] = snapshot["last_label_action"]
+        elif label_time:
+            snapshot["latest_action_kind"] = "label"
+            snapshot["latest_action"] = snapshot["last_label_action"]
+        elif undo_time:
+            snapshot["latest_action_kind"] = "undo"
+            snapshot["latest_action"] = snapshot["last_undo_action"]
+        else:
+            snapshot["latest_action_kind"] = None
+            snapshot["latest_action"] = None
 
         try:
             self._ensure_batch_dir(batch_id)

@@ -440,7 +440,7 @@ def test_label_and_undo_updates_overview(test_dir: Path, example_dir: Path) -> T
         result.add_detail(f"标注后: 操作={last_action.get('operation')}, 新状态={last_action.get('new_status')}")
 
         code, out, err = run_cli(["overview"], work_dir=str(work_dir))
-        assert "最近标注动作" in out
+        assert "最近动作" in out
         assert "根因" in out or "修改状态" in out, f"CLI 应显示标注信息: {out[:500]}"
         result.add_detail("CLI 正确显示最近标注动作")
 
@@ -625,7 +625,7 @@ def test_cli_full_chain_consistency(test_dir: Path, example_dir: Path) -> TestRe
         assert code == 0, f"overview (create后) 失败: {err}"
         assert "完整链路验证批次" in out
         assert "暂无已导入文件" in out
-        assert "暂无标注记录" in out
+        assert "暂无标注或撤销记录" in out
         assert "暂无导出记录" in out
         assert "1.0.0" in out
         result.add_detail("✅ create 后概览正确")
@@ -705,8 +705,8 @@ def test_cli_full_chain_consistency(test_dir: Path, example_dir: Path) -> TestRe
 
         code, out, err = run_cli(["overview"], work_dir=str(work_dir))
         assert code == 0, f"overview (undo-label后) 失败: {err}"
-        assert "最近记录已被撤销" in out or "暂无标注记录" in out
-        result.add_detail("✅ undo-label 后概览清空标注记录")
+        assert "撤销标注" in out or "类型:   撤销" in out, f"应显示撤销标注动作: {out[:500]}"
+        result.add_detail("✅ undo-label 后概览显示撤销动作")
 
         code, out, err = run_cli(["undo-import"], work_dir=str(work_dir))
         assert code == 0, f"undo-import 失败: {err}"
@@ -714,8 +714,19 @@ def test_cli_full_chain_consistency(test_dir: Path, example_dir: Path) -> TestRe
 
         code, out, err = run_cli(["overview"], work_dir=str(work_dir))
         assert code == 0, f"overview (undo-import后) 失败: {err}"
-        assert "notes.json" not in out, f"撤销后不应再显示 notes.json: {out[:500]}"
-        result.add_detail("✅ undo-import 后概览移除已撤销文件")
+        import_section = ""
+        in_imports = False
+        for line in out.splitlines():
+            if "已导入数据" in line:
+                in_imports = True
+                continue
+            if "数据统计" in line:
+                in_imports = False
+                break
+            if in_imports:
+                import_section += line + "\n"
+        assert "notes.json" not in import_section, f"撤销后已导入数据区不应再显示 notes.json: {import_section[:500]}"
+        result.add_detail("✅ undo-import 后概览移除已撤销文件（已导入数据区）")
 
         store = StateStore(str(work_dir))
         batch_id = store.get_active_batch()

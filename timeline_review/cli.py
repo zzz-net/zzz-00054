@@ -214,34 +214,93 @@ class CLIApp:
                 print(f"     - {fname}: {cnt} 个")
 
         print()
-        print("🏷️  最近标注动作:")
-        last_label = snapshot.get("last_label_action")
+        print("🏷️  最近动作:")
+        latest_kind = snapshot.get("latest_action_kind")
+        latest = snapshot.get("latest_action")
         label_count = snapshot.get("label_action_count", 0)
-        if not last_label:
-            if label_count == 0:
-                print("   (暂无标注记录)")
+        undo_count = snapshot.get("undo_action_count", 0)
+        last_label = snapshot.get("last_label_action")
+        last_undo = snapshot.get("last_undo_action")
+        if not latest:
+            if label_count == 0 and undo_count == 0:
+                print("   (暂无标注或撤销记录)")
+            elif label_count > 0 and last_label is None:
+                print(f"   (标注 {label_count} 次，全部已撤销)")
             else:
-                print(f"   (历史标注 {label_count} 次，最近记录已被撤销)")
-        else:
-            op = last_label.get("operation", "未知操作")
-            eid_short = last_label.get("event_id_short", "???")
-            acted_at = last_label.get("acted_at", "")
+                parts = []
+                if label_count:
+                    parts.append(f"标注 {label_count} 次")
+                if undo_count:
+                    parts.append(f"撤销 {undo_count} 次")
+                print(f"   ({', '.join(parts)}，无可用详情)")
+        elif latest_kind == "label":
+            op = latest.get("operation", "未知操作")
+            eid_short = latest.get("event_id_short", "???")
+            acted_at = latest.get("acted_at", "")
+            print(f"   类型:   标注")
             print(f"   操作:   {op}")
             print(f"   事件:   {eid_short}")
-            if last_label.get("old_status") or last_label.get("new_status"):
-                old_s = last_label.get("old_status") or "无"
-                new_s = last_label.get("new_status") or "无"
+            if latest.get("old_status") or latest.get("new_status"):
+                old_s = latest.get("old_status") or "无"
+                new_s = latest.get("new_status") or "无"
                 print(f"   状态:   {old_s}  →  {new_s}")
-            if last_label.get("old_notes_preview") is not None or last_label.get("new_notes_preview") is not None:
-                old_n = last_label.get("old_notes_preview") or "(空)"
-                new_n = last_label.get("new_notes_preview") or "(空)"
+            if latest.get("old_notes_preview") is not None or latest.get("new_notes_preview") is not None:
+                old_n = latest.get("old_notes_preview") or "(空)"
+                new_n = latest.get("new_notes_preview") or "(空)"
                 print(f"   备注:   {old_n}  →  {new_n}")
-            if last_label.get("config_version"):
-                print(f"   规则版本: {last_label['config_version']}")
+            if latest.get("config_version"):
+                print(f"   规则版本: {latest['config_version']}")
             if acted_at:
                 print(f"   操作时间: {acted_at}")
-            if label_count > 1:
-                print(f"   (共 {label_count} 次标注操作记录)")
+            total = label_count + undo_count
+            if total > 1:
+                parts = []
+                if label_count:
+                    parts.append(f"标注 {label_count} 次")
+                if undo_count:
+                    parts.append(f"撤销 {undo_count} 次")
+                print(f"   (共 {total} 次操作: {', '.join(parts)})")
+        elif latest_kind == "undo":
+            undo_type_desc = latest.get("undo_type_desc", "撤销")
+            acted_at = latest.get("acted_at", "")
+            print(f"   类型:   {undo_type_desc}")
+            if latest.get("undo_type") == "undo_label":
+                eid_short = latest.get("event_id_short", "???")
+                op_desc = latest.get("operation_description", "未知操作")
+                print(f"   原操作: {op_desc}")
+                print(f"   事件:   {eid_short}")
+                rest_s = latest.get("restored_status")
+                if rest_s:
+                    print(f"   恢复状态: {rest_s}")
+                if latest.get("old_notes_preview") is not None:
+                    old_n = latest.get("old_notes_preview") or "(空)"
+                    print(f"   恢复备注: {old_n}")
+                if latest.get("config_version"):
+                    print(f"   规则版本: {latest['config_version']}")
+            elif latest.get("undo_type") == "undo_import":
+                fname = latest.get("filename", "未知文件")
+                stype = latest.get("source_type", "未知类型")
+                print(f"   文件:   [{stype}] {fname}")
+                rem_ev = latest.get("removed_event_count", 0)
+                rem_err = latest.get("removed_error_count", 0)
+                print(f"   清理:   删除 {rem_ev} 条事件, {rem_err} 个解析错误")
+                orig_ev = latest.get("imported_event_count", 0)
+                orig_err = latest.get("imported_error_count", 0)
+                if rem_ev != orig_ev or rem_err != orig_err:
+                    print(f"   (导入时: {orig_ev} 事件, {orig_err} 错误)")
+                imp_ts = latest.get("imported_at", "")
+                if imp_ts:
+                    print(f"   原导入时间: {imp_ts}")
+            if acted_at:
+                print(f"   撤销时间: {acted_at}")
+            total = label_count + undo_count
+            if total > 1:
+                parts = []
+                if label_count:
+                    parts.append(f"标注 {label_count} 次")
+                if undo_count:
+                    parts.append(f"撤销 {undo_count} 次")
+                print(f"   (共 {total} 次操作: {', '.join(parts)})")
 
         print()
         print("📤 最近导出:")
@@ -371,8 +430,8 @@ class CLIApp:
         if not last:
             print("ℹ️  没有可撤销的导入记录")
             return
-        print(f"↩️  已撤销导入记录: {last['filename']}")
-        print(f"   (注意: 已导入的事件需要手动清理，或重新创建批次)")
+        print(f"↩️  已撤销导入: {last['filename']}")
+        print(f"   已同步清理对应事件和解析错误")
 
     def cmd_timeline(self, args) -> None:
         batch_id = self._require_batch()
