@@ -4,7 +4,7 @@ import os
 import io
 from pathlib import Path
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
 
 if sys.platform == "win32":
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
@@ -123,12 +123,44 @@ class CLIApp:
             print("   提示: 使用 'create' 创建批次，或 'switch' 切换到已有批次")
             return
 
-        try:
-            snapshot = self.store.load_overview_snapshot(batch_id)
-        except Exception as e:
-            print(f"⚠️  概览数据加载失败，正在重建: {e}")
-            snapshot = self.store.refresh_overview_snapshot(batch_id)
+        if args.history:
+            self._print_snapshot_history(batch_id, args.history_limit)
+            return
 
+        if args.check_consistency:
+            self._check_and_print_consistency(batch_id, args.fix)
+            return
+
+        if args.fix:
+            self._fix_and_print_snapshot(batch_id)
+            return
+
+        if args.change_log:
+            self._print_change_log(batch_id, args.log_limit, args.log_type)
+            return
+
+        if args.export_diff:
+            self._print_export_diff(batch_id)
+            return
+
+        if args.compare_with:
+            self._print_change_summary(batch_id, args.compare_with, args.refresh)
+            return
+
+        if args.refresh:
+            snapshot = self.store.refresh_overview_snapshot(batch_id, trigger="manual")
+            print("🔄 已强制刷新快照")
+            print()
+        else:
+            try:
+                snapshot = self.store.load_overview_snapshot(batch_id)
+            except Exception as e:
+                print(f"⚠️  概览数据加载失败，正在重建: {e}")
+                snapshot = self.store.refresh_overview_snapshot(batch_id, trigger="repair")
+
+        self._print_basic_overview(batch_id, snapshot)
+
+    def _print_basic_overview(self, batch_id: str, snapshot: Dict) -> None:
         if not snapshot:
             print("⚠️  无法获取批次概览，批次目录可能已损坏")
             return
@@ -343,6 +375,285 @@ class CLIApp:
 
         print()
 
+    def _print_snapshot_history(self, batch_id: str, limit: int) -> None:
+        snapshots = self.store.list_historical_snapshots(batch_id, limit=limit)
+        trigger_labels = {
+            "create": "创建批次",
+            "import": "导入数据",
+            "config": "配置变更",
+            "label": "标注事件",
+            "undo_label": "撤销标注",
+            "undo_import": "撤销导入",
+            "export": "导出报告",
+            "manual": "手动刷新",
+            "auto_refresh": "自动刷新",
+            "repair": "修复快照",
+        }
+
+        print("=" * 78)
+        print(f"📜 历史快照记录 (最近 {len(snapshots)} 条):")
+        print("=" * 78)
+        print(f"{'快照ID':<32} {'触发原因':<12} {'事件数':<8} {'导入数':<8} {'版本':<10} {'保存时间'}")
+        print("-" * 78)
+
+        if not snapshots:
+            print("   (暂无历史快照记录)")
+        else:
+            for s in snapshots:
+                trigger = trigger_labels.get(s.get("trigger", "unknown"), s.get("trigger", "unknown"))
+                saved_at = s.get("saved_at", "").replace("T", " ")[:19]
+                print(f"{s.get('snapshot_id',''):<32} {trigger:<12} {s.get('event_count',0):<8} {s.get('imported_file_count',0):<8} {s.get('rule_version',''):<10} {saved_at}")
+
+        print()
+        print("💡 提示: 使用 --diff <快照ID> 与指定快照对比")
+
+    def _check_and_print_consistency(self, batch_id: str, fix: bool = False) -> None:
+        print("🔍 正在检查快照与真实数据的一致性...")
+        print()
+        result = self.store.check_snapshot_consistency(batch_id)
+
+        if result.get("consistent", False):
+            print("✅ 快照与真实数据一致")
+            real = result.get("real_data", {})
+            print(f"   事件数: {real.get('event_count', 0)}")
+            print(f"   导入文件数: {real.get('imported_file_count', 0)}")
+            print(f"   规则版本: {real.get('rule_version', 'unknown')}")
+        else:
+            print("❌ 发现快照与真实数据不一致")
+            print()
+            print(f"{'字段':<25} {'快照值':<15} {'真实值':<15} {'差异'}")
+            print("-" * 70)
+            for inc in result.get("inconsistencies", []):
+                field = inc.get("field", "")
+                snap = inc.get("snapshot", 0)
+                real = inc.get("real", 0)
+                diff = inc.get("diff", 0)
+                diff_str = f"+{diff}" if diff > 0 else str(diff)
+                print(f"{field:<25} {str(snap):<15} {str(real):<15} {diff_str}")
+
+            if fix:
+                print()
+                print("🔧 正在自动修复...")
+                fix_result = self.store.fix_snapshot_inconsistencies(batch_id)
+                if fix_result.get("fixed", False):
+                    print("✅ 快照已修复")
+                else:
+                    print(f"❌ 修复失败: {fix_result.get('message', '未知错误')}")
+            else:
+                print()
+                print("💡 提示: 使用 --fix 参数自动修复快照不一致")
+
+        print()
+
+    def _fix_and_print_snapshot(self, batch_id: str) -> None:
+        print("🔧 正在检查并修复快照...")
+        print()
+        check_result = self.store.check_snapshot_consistency(batch_id)
+
+        if check_result.get("consistent", False):
+            print("✅ 快照一致，无需修复")
+        else:
+            fix_result = self.store.fix_snapshot_inconsistencies(batch_id)
+            if fix_result.get("fixed", False):
+                print(f"✅ 已修复 {len(fix_result.get('inconsistencies_fixed', []))} 处不一致")
+                for inc in fix_result.get("inconsistencies_fixed", []):
+                    print(f"   - {inc['field']}: {inc['snapshot']} → {inc['real']}")
+            else:
+                print(f"❌ 修复失败: {fix_result.get('message', '未知错误')}")
+        print()
+
+    def _print_change_log(self, batch_id: str, limit: int, log_type: str = None) -> None:
+        log = self.store.get_change_log(batch_id, limit=limit, change_type=log_type)
+
+        type_labels = {
+            "import_change": "📥 导入变更",
+            "config_change": "⚙️  配置变更",
+            "export_change": "📤 导出变更",
+            "label_change": "🏷️  标注变更",
+            "snapshot_repair": "🔧 快照修复",
+            "other_change": "🔄 其他变更",
+            "manual_refresh": "👆 手动刷新",
+        }
+        severity_icons = {
+            "info": "ℹ️ ",
+            "warning": "⚠️ ",
+            "error": "❌",
+        }
+
+        print("=" * 78)
+        title = "变更日志"
+        if log_type:
+            title += f" (类型: {log_type})"
+        print(f"📜 {title} (最近 {len(log)} 条):")
+        print("=" * 78)
+
+        if not log:
+            print("   (暂无变更记录)")
+        else:
+            for entry in log:
+                ctype = entry.get("change_type", "unknown")
+                severity = entry.get("severity", "info")
+                icon = severity_icons.get(severity, "  ")
+                type_label = type_labels.get(ctype, ctype)
+                created_at = entry.get("created_at", "").replace("T", " ")[:19]
+                entry_id = entry.get("id", "")
+
+                print(f"{icon} [{created_at}] {type_label} (ID: {entry_id})")
+                detail = entry.get("detail", {})
+                summary = detail.get("diff_summary", [])
+                if summary:
+                    for s in summary[:5]:
+                        print(f"   • {s}")
+                    if len(summary) > 5:
+                        print(f"   ... 还有 {len(summary) - 5} 条变更")
+                else:
+                    for k, v in detail.items():
+                        if v:
+                            print(f"   • {k}: {v}")
+                print()
+
+        print("💡 提示: 使用 --log-type <类型> 过滤变更类型")
+
+    def _print_export_diff(self, batch_id: str) -> None:
+        result = self.store.get_export_comparison(batch_id)
+        exports = result.get("exports", [])
+        comparison = result.get("comparison")
+
+        print("=" * 62)
+        print("📤 导出历史与对比:")
+        print("=" * 62)
+        print()
+
+        if not exports:
+            print("   (暂无导出记录)")
+        else:
+            print(f"共 {len(exports)} 次导出:")
+            print()
+            for i, exp in enumerate(exports[:10], 1):
+                modified_at = exp.get("modified_at", "").replace("T", " ")[:19]
+                size = exp.get("size", 0)
+                print(f"   {i:>2}. {exp.get('filename',''):<40} {size:>8} 字节  {modified_at}")
+
+            if comparison:
+                print()
+                print("📊 最近两次导出对比:")
+                latest = comparison.get("latest", {})
+                previous = comparison.get("previous", {})
+                size_diff = comparison.get("size_diff", 0)
+                size_diff_pct = comparison.get("size_diff_percent", 0)
+                time_diff = comparison.get("time_diff_seconds")
+
+                arrow = "↑" if size_diff > 0 else ("↓" if size_diff < 0 else "=")
+                print(f"   文件:     {previous.get('filename','')}  →  {latest.get('filename','')}")
+                print(f"   大小:     {previous.get('size',0)} → {latest.get('size',0)} 字节  {arrow} {abs(size_diff)} ({size_diff_pct:+}%)")
+                if time_diff is not None:
+                    minutes, seconds = divmod(time_diff, 60)
+                    time_str = f"{minutes}分{seconds}秒" if minutes > 0 else f"{seconds}秒"
+                    print(f"   间隔:     {time_str}")
+
+        print()
+
+    def _print_change_summary(self, batch_id: str, compare_with: str, refresh: bool = False) -> None:
+        if refresh:
+            print("🔄 正在刷新快照...")
+            self.store.refresh_overview_snapshot(batch_id, trigger="manual")
+            print()
+
+        print("📊 正在生成变更摘要...")
+        print()
+        result = self.store.get_change_summary(batch_id, compare_with=compare_with)
+
+        if result.get("error"):
+            print(f"❌ {result.get('error')}")
+            return
+
+        note = result.get("note", "")
+        if note:
+            print(f"ℹ️  {note}")
+            print()
+
+        diff = result.get("diff")
+        if not diff:
+            print("📋 没有可对比的变更（当前为初始状态）")
+            return
+
+        print("=" * 62)
+        print("📊 变更摘要:")
+        print("=" * 62)
+        print()
+
+        summary = diff.get("summary", [])
+        if summary:
+            for s in summary:
+                print(f"   • {s}")
+            print()
+
+        if diff.get("event_count_change") is not None:
+            change = diff["event_count_change"]
+            arrow = "+" if change > 0 else ""
+            print(f"   事件数变化:    {arrow}{change}")
+            if diff.get("added_events") > 0:
+                print(f"     新增: {diff['added_events']}")
+            if diff.get("removed_events") > 0:
+                print(f"     移除: {diff['removed_events']}")
+
+        status_changes = diff.get("status_changes", {})
+        if status_changes:
+            print()
+            print("   状态分布变化:")
+            for status, change in sorted(status_changes.items()):
+                arrow = "+" if change > 0 else ""
+                print(f"     {status:<8} {arrow}{change}")
+
+        source_changes = diff.get("source_changes", {})
+        if source_changes:
+            print()
+            src_label = {"log": "日志", "alert": "告警", "note": "备注"}
+            print("   来源分布变化:")
+            for source, change in sorted(source_changes.items()):
+                arrow = "+" if change > 0 else ""
+                label = src_label.get(source, source)
+                print(f"     {label:<8} {arrow}{change}")
+
+        config_changes = diff.get("config_changes", {})
+        if config_changes:
+            print()
+            print("   配置变更:")
+            for field, change in config_changes.items():
+                old = change.get("old")
+                new = change.get("new")
+                print(f"     {field}: {old} → {new}")
+
+        import_changes = diff.get("import_changes", [])
+        if import_changes:
+            print()
+            print("   导入变更:")
+            for ic in import_changes:
+                if ic.get("type") == "added":
+                    print(f"     ✅ 新增: {ic.get('filename')} ({ic.get('source_type')}, {ic.get('event_count',0)}事件)")
+                elif ic.get("type") == "removed":
+                    print(f"     ❌ 移除: {ic.get('filename')} ({ic.get('source_type')})")
+
+        export_changes = diff.get("export_changes", [])
+        if export_changes:
+            print()
+            print("   导出变更:")
+            for ec in export_changes:
+                print(f"     📤 新增导出: {ec.get('filename')} ({ec.get('size',0)}字节)")
+
+        label_changes = diff.get("label_changes", [])
+        if label_changes:
+            print()
+            print("   标注变更:")
+            for lc in label_changes:
+                if lc.get("type") == "label":
+                    print(f"     🏷️  {lc.get('operation')}: {lc.get('event_id_short')} → {lc.get('new_status')}")
+                elif lc.get("type") == "undo":
+                    print(f"     ↩️  {lc.get('undo_type_desc')}")
+
+        print()
+        print("💡 提示: 使用 --diff first 与最初状态对比，或 --diff <快照ID> 与指定快照对比")
+
     def cmd_import(self, args) -> None:
         batch_id = self._require_batch()
         config = self.store.load_config(batch_id)
@@ -352,6 +663,8 @@ class CLIApp:
         total_events_imported = 0
         total_errors = 0
         files_processed = []
+        files_skipped = []
+        files_warnings = []
         all_errors = list(self.store.load_parse_errors(batch_id))
 
         for file_path in args.files:
@@ -361,9 +674,73 @@ class CLIApp:
                 continue
 
             abs_path = str(path.resolve())
-            if not args.force and self.store.is_file_imported(batch_id, abs_path):
-                print(f"⏭️  文件已导入过，跳过: {path.name} (使用 --force 强制重新导入)")
+
+            try:
+                file_hash = compute_file_hash(str(path))
+            except Exception as e:
+                print(f"❌ 无法计算文件哈希 {path.name}: {e}", file=sys.stderr)
                 continue
+
+            dup_check = self.store.check_duplicate_import(batch_id, abs_path, file_hash)
+            if dup_check.get("is_duplicate"):
+                if args.force:
+                    existing = dup_check.get("existing_entry", {})
+                    if dup_check.get("hash_changed"):
+                        print(f"⚠️  强制重新导入: {path.name}")
+                        print(f"   文件内容已变更 (哈希不匹配)")
+                        print(f"   旧哈希: {existing.get('file_hash', '')[:16]}...")
+                        print(f"   新哈希: {file_hash[:16]}...")
+                        files_warnings.append({
+                            "file": path.name,
+                            "warning": "文件内容已变更，强制重新导入",
+                        })
+                        self.store.log_change(batch_id, "import_change", {
+                            "action": "force_reimport",
+                            "filename": path.name,
+                            "hash_changed": True,
+                            "old_hash": existing.get("file_hash", "")[:16],
+                            "new_hash": file_hash[:16],
+                            "old_event_count": existing.get("event_count", 0),
+                        }, severity="warning")
+                    else:
+                        print(f"⚠️  强制重新导入: {path.name}")
+                        print(f"   文件内容未变更，与上次导入相同")
+                        files_warnings.append({
+                            "file": path.name,
+                            "warning": "文件内容未变更，强制重新导入",
+                        })
+                        self.store.log_change(batch_id, "import_change", {
+                            "action": "force_reimport",
+                            "filename": path.name,
+                            "hash_changed": False,
+                            "old_event_count": existing.get("event_count", 0),
+                        }, severity="info")
+                else:
+                    existing = dup_check.get("existing_entry", {})
+                    recommendation = dup_check.get("recommendation", "skip")
+                    if recommendation == "force_reimport":
+                        print(f"⚠️  冲突: 文件已导入但内容已变更: {path.name}")
+                        print(f"   原导入时间: {existing.get('imported_at', 'N/A')}")
+                        print(f"   原导入事件: {existing.get('event_count', 0)} 条")
+                        print(f"   💡 使用 --force 强制重新导入")
+                    else:
+                        print(f"⏭️  文件已导入过，跳过: {path.name}")
+                        print(f"   导入时间: {existing.get('imported_at', 'N/A')}")
+                        print(f"   事件数: {existing.get('event_count', 0)} 条")
+                        print(f"   💡 使用 --force 强制重新导入")
+                    files_skipped.append({
+                        "file": path.name,
+                        "reason": "duplicate",
+                        "recommendation": recommendation,
+                        "existing": existing,
+                    })
+                    self.store.log_change(batch_id, "import_change", {
+                        "action": "skipped_duplicate",
+                        "filename": path.name,
+                        "hash_changed": dup_check.get("hash_changed", False),
+                        "recommendation": recommendation,
+                    }, severity="info")
+                    continue
 
             if args.type:
                 parser = get_parser_by_type(args.type, config)
@@ -399,7 +776,6 @@ class CLIApp:
             else:
                 print(f"   ℹ️  没有新事件需要导入")
 
-            file_hash = compute_file_hash(str(path))
             self.store.mark_file_imported(batch_id, abs_path, file_hash, len(unique_new), len(parse_errors))
             files_processed.append(path.name)
 
@@ -420,9 +796,30 @@ class CLIApp:
         print()
         print(f"📦 导入完成:")
         print(f"   处理文件: {len(files_processed)} 个")
+        if files_skipped:
+            print(f"   跳过文件: {len(files_skipped)} 个")
+            for s in files_skipped:
+                reason = s.get("reason", "unknown")
+                if reason == "duplicate":
+                    rec = s.get("recommendation", "skip")
+                    if rec == "force_reimport":
+                        print(f"     ⚠️  {s['file']}: 内容已变更，建议 --force 重新导入")
+                    else:
+                        print(f"     ℹ️  {s['file']}: 已存在，使用 --force 强制重导")
         print(f"   新增事件: {total_events_imported} 条")
         print(f"   解析错误: {total_errors} 个")
         print(f"   当前批次事件总数: {len(existing_events)} 条")
+
+        if files_warnings:
+            print()
+            print(f"⚠️  导入警告 ({len(files_warnings)} 条):")
+            for w in files_warnings:
+                print(f"   • {w['file']}: {w['warning']}")
+
+        if files_skipped and any(s.get("recommendation") == "force_reimport" for s in files_skipped):
+            print()
+            print(f"💡 提示: 有 {sum(1 for s in files_skipped if s.get('recommendation') == 'force_reimport')} 个文件内容已变更")
+            print(f"   可使用: timeline-review import --force {' '.join(s['file'] for s in files_skipped if s.get('recommendation') == 'force_reimport')}")
 
     def cmd_undo_import(self, args) -> None:
         batch_id = self._require_batch()
@@ -840,6 +1237,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_status = subparsers.add_parser("status", help="显示当前批次状态")
 
     p_overview = subparsers.add_parser("overview", help="批次概览（一目了然显示进度）")
+    p_overview.add_argument("--diff", "--compare-with", dest="compare_with", const="previous", nargs="?", default=None, help="显示与历史快照的变更摘要，可指定 previous/first/快照ID")
+    p_overview.add_argument("--history", action="store_true", help="列出历史快照")
+    p_overview.add_argument("--history-limit", type=int, default=20, help="历史快照显示数量")
+    p_overview.add_argument("--check-consistency", action="store_true", help="检查快照与真实数据的一致性")
+    p_overview.add_argument("--fix", action="store_true", help="自动修复快照不一致问题")
+    p_overview.add_argument("--change-log", action="store_true", help="显示变更日志")
+    p_overview.add_argument("--log-limit", type=int, default=20, help="变更日志显示数量")
+    p_overview.add_argument("--log-type", choices=["import_change", "config_change", "export_change", "label_change", "snapshot_repair", "other_change", "manual_refresh"], help="按类型过滤变更日志")
+    p_overview.add_argument("--export-diff", action="store_true", help="显示最近导出对比")
+    p_overview.add_argument("--refresh", "-r", action="store_true", help="强制刷新快照")
 
     p_import = subparsers.add_parser("import", help="导入日志/告警/备注文件")
     p_import.add_argument("files", nargs="+", help="要导入的文件路径")

@@ -107,7 +107,7 @@ class StateStore:
         self._write_label_history(batch_id, [])
         self._write_undo_history(batch_id, [])
         self._set_active_batch(batch_id)
-        self.refresh_overview_snapshot(batch_id)
+        self.refresh_overview_snapshot(batch_id, trigger="create")
         return meta
 
     def get_batch_meta(self, batch_id: str) -> Dict:
@@ -156,7 +156,7 @@ class StateStore:
         with open(self._config_path(batch_id), "w", encoding="utf-8") as f:
             json.dump(config.to_dict(), f, ensure_ascii=False, indent=2)
         try:
-            self.refresh_overview_snapshot(batch_id)
+            self.refresh_overview_snapshot(batch_id, trigger="config")
         except Exception:
             pass
 
@@ -175,7 +175,7 @@ class StateStore:
             json.dump(data, f, ensure_ascii=False, indent=2)
         self.update_batch_meta(batch_id, event_count=len(events))
         try:
-            self.refresh_overview_snapshot(batch_id)
+            self.refresh_overview_snapshot(batch_id, trigger="import")
         except Exception:
             pass
 
@@ -277,7 +277,7 @@ class StateStore:
         history.append(history_entry)
         self._write_label_history(batch_id, history)
         try:
-            self.refresh_overview_snapshot(batch_id)
+            self.refresh_overview_snapshot(batch_id, trigger="label")
         except Exception:
             pass
 
@@ -356,7 +356,7 @@ class StateStore:
         except Exception:
             pass
         try:
-            self.refresh_overview_snapshot(batch_id)
+            self.refresh_overview_snapshot(batch_id, trigger="undo_label")
         except Exception:
             pass
         return last
@@ -367,7 +367,7 @@ class StateStore:
         with open(self._parse_errors_path(batch_id), "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         try:
-            self.refresh_overview_snapshot(batch_id)
+            self.refresh_overview_snapshot(batch_id, trigger="import")
         except Exception:
             pass
 
@@ -429,7 +429,7 @@ class StateStore:
         index.append(entry)
         self._write_imports_index(batch_id, index)
         try:
-            self.refresh_overview_snapshot(batch_id)
+            self.refresh_overview_snapshot(batch_id, trigger="import")
         except Exception:
             pass
         return entry
@@ -491,7 +491,7 @@ class StateStore:
         except Exception:
             pass
         try:
-            self.refresh_overview_snapshot(batch_id)
+            self.refresh_overview_snapshot(batch_id, trigger="undo_import")
         except Exception:
             pass
         return last
@@ -505,7 +505,536 @@ class StateStore:
         else:
             return "日志(LOG)"
 
-    def refresh_overview_snapshot(self, batch_id: str) -> Dict:
+
+
+    def load_overview_snapshot(self, batch_id: str, auto_refresh: bool = True) -> Dict:
+        path = self._overview_snapshot_path(batch_id)
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, IOError):
+                pass
+        if auto_refresh:
+            return self.refresh_overview_snapshot(batch_id, trigger="auto_refresh")
+        return {}
+
+    def save_export(self, batch_id: str, export_type: str, content: str, filename: str) -> str:
+        batch_dir = self._ensure_batch_dir(batch_id)
+        exports_dir = batch_dir / "exports"
+        exports_dir.mkdir(exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        name, ext = os.path.splitext(filename)
+        export_filename = f"{name}_{ts}{ext}"
+        export_path = exports_dir / export_filename
+        with open(export_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        try:
+            self.refresh_overview_snapshot(batch_id, trigger="export")
+        except Exception:
+            pass
+        return str(export_path)
+
+    def get_exports(self, batch_id: str) -> List[Dict]:
+        batch_dir = self._get_batch_dir(batch_id)
+        exports_dir = batch_dir / "exports"
+        result = []
+        if exports_dir.exists():
+            for f in exports_dir.iterdir():
+                if f.is_file():
+                    result.append({
+                        "filename": f.name,
+                        "path": str(f),
+                        "size": f.stat().st_size,
+                        "modified_at": datetime.fromtimestamp(f.stat().st_mtime).isoformat(),
+                    })
+        result.sort(key=lambda x: x["modified_at"], reverse=True)
+        return result
+
+    def _historical_snapshots_dir(self, batch_id: str) -> Path:
+        return self._get_batch_dir(batch_id) / "snapshots_history"
+
+    def _change_log_path(self, batch_id: str) -> Path:
+        return self._get_batch_dir(batch_id) / "change_log.json"
+
+    def _snapshot_consistency_marker_path(self, batch_id: str) -> Path:
+        return self._get_batch_dir(batch_id) / "snapshot_consistency.json"
+
+    def _save_historical_snapshot(self, batch_id: str, snapshot: Dict, trigger: str) -> str:
+        try:
+            snapshots_dir = self._historical_snapshots_dir(batch_id)
+            snapshots_dir.mkdir(exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            snapshot_id = f"snap_{ts}"
+            filename = f"{snapshot_id}.json"
+            filepath = snapshots_dir / filename
+            historical_copy = copy.deepcopy(snapshot)
+            historical_copy["snapshot_id"] = snapshot_id
+            historical_copy["trigger"] = trigger
+            historical_copy["saved_at"] = datetime.now().isoformat()
+            with open(filepath, "w", encoding="utf-8") as f:
+                json.dump(historical_copy, f, ensure_ascii=False, indent=2)
+            return snapshot_id
+        except Exception:
+            return ""
+
+    def list_historical_snapshots(self, batch_id: str, limit: int = 20) -> List[Dict]:
+        snapshots_dir = self._historical_snapshots_dir(batch_id)
+        if not snapshots_dir.exists():
+            return []
+        result = []
+        for f in sorted(snapshots_dir.iterdir(), reverse=True):
+            if f.is_file() and f.suffix == ".json":
+                try:
+                    with open(f, "r", encoding="utf-8") as fp:
+                        data = json.load(fp)
+                    result.append({
+                        "snapshot_id": data.get("snapshot_id", f.stem),
+                        "trigger": data.get("trigger", "unknown"),
+                        "saved_at": data.get("saved_at", ""),
+                        "event_count": data.get("event_count", 0),
+                        "imported_file_count": data.get("imported_file_count", 0),
+                        "label_action_count": data.get("label_action_count", 0),
+                        "export_count": data.get("export_count", 0),
+                        "rule_version": data.get("rule_version", "unknown"),
+                        "filepath": str(f),
+                    })
+                except (json.JSONDecodeError, IOError):
+                    continue
+            if len(result) >= limit:
+                break
+        return result
+
+    def load_historical_snapshot(self, batch_id: str, snapshot_id: str) -> Optional[Dict]:
+        snapshots_dir = self._historical_snapshots_dir(batch_id)
+        filepath = snapshots_dir / f"{snapshot_id}.json"
+        if not filepath.exists():
+            return None
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return None
+
+    def _compare_snapshots(self, old_snap: Dict, new_snap: Dict) -> Dict:
+        diff = {
+            "changes": {},
+            "added_events": 0,
+            "removed_events": 0,
+            "status_changes": {},
+            "source_changes": {},
+            "severity_changes": {},
+            "config_changes": {},
+            "import_changes": [],
+            "export_changes": [],
+            "label_changes": [],
+            "summary": [],
+        }
+
+        old_events = old_snap.get("event_count", 0)
+        new_events = new_snap.get("event_count", 0)
+        if old_events != new_events:
+            diff["event_count_change"] = new_events - old_events
+            if new_events > old_events:
+                diff["added_events"] = new_events - old_events
+                diff["summary"].append(f"事件数变化: +{new_events - old_events}")
+            else:
+                diff["removed_events"] = old_events - new_events
+                diff["summary"].append(f"事件数变化: -{old_events - new_events}")
+
+        old_by_status = old_snap.get("events_by_status", {})
+        new_by_status = new_snap.get("events_by_status", {})
+        all_statuses = set(old_by_status.keys()) | set(new_by_status.keys())
+        for s in all_statuses:
+            old_val = old_by_status.get(s, 0)
+            new_val = new_by_status.get(s, 0)
+            if old_val != new_val:
+                diff["status_changes"][s] = new_val - old_val
+
+        old_by_source = old_snap.get("events_by_source", {})
+        new_by_source = new_snap.get("events_by_source", {})
+        all_sources = set(old_by_source.keys()) | set(new_by_source.keys())
+        for s in all_sources:
+            old_val = old_by_source.get(s, 0)
+            new_val = new_by_source.get(s, 0)
+            if old_val != new_val:
+                diff["source_changes"][s] = new_val - old_val
+
+        old_by_severity = old_snap.get("events_by_severity", {})
+        new_by_severity = new_snap.get("events_by_severity", {})
+        all_severities = set(old_by_severity.keys()) | set(new_by_severity.keys())
+        for s in all_severities:
+            old_val = old_by_severity.get(s, 0)
+            new_val = new_by_severity.get(s, 0)
+            if old_val != new_val:
+                diff["severity_changes"][s] = new_val - old_val
+
+        config_fields = ["rule_version", "dedup_window_seconds", "gap_threshold_seconds",
+                         "dedup_similarity_threshold", "phase_count"]
+        for field in config_fields:
+            old_val = old_snap.get(field)
+            new_val = new_snap.get(field)
+            if old_val != new_val:
+                diff["config_changes"][field] = {"old": old_val, "new": new_val}
+                diff["summary"].append(f"配置变更: {field}: {old_val} → {new_val}")
+
+        old_files = {f.get("filename"): f for f in old_snap.get("imported_files", [])}
+        new_files = {f.get("filename"): f for f in new_snap.get("imported_files", [])}
+        for fname in new_files:
+            if fname not in old_files:
+                nf = new_files[fname]
+                diff["import_changes"].append({
+                    "type": "added",
+                    "filename": fname,
+                    "source_type": nf.get("source_type"),
+                    "event_count": nf.get("event_count", 0),
+                    "error_count": nf.get("error_count", 0),
+                    "imported_at": nf.get("imported_at"),
+                })
+                diff["summary"].append(f"新增导入: {fname} ({nf.get('source_type')}, {nf.get('event_count', 0)}事件)")
+        for fname in old_files:
+            if fname not in new_files:
+                of = old_files[fname]
+                diff["import_changes"].append({
+                    "type": "removed",
+                    "filename": fname,
+                    "source_type": of.get("source_type"),
+                    "event_count": of.get("event_count", 0),
+                    "error_count": of.get("error_count", 0),
+                })
+                diff["summary"].append(f"移除导入: {fname}")
+
+        old_export_count = old_snap.get("export_count", 0)
+        new_export_count = new_snap.get("export_count", 0)
+        if new_export_count > old_export_count:
+            last_exp = new_snap.get("last_export", {})
+            diff["export_changes"].append({
+                "type": "new_export",
+                "filename": last_exp.get("filename"),
+                "size": last_exp.get("size"),
+                "exported_at": last_exp.get("exported_at"),
+            })
+            diff["summary"].append(f"新增导出: {last_exp.get('filename')} ({last_exp.get('size')}字节)")
+
+        old_label_count = old_snap.get("label_action_count", 0)
+        new_label_count = new_snap.get("label_action_count", 0)
+        old_undo_count = old_snap.get("undo_action_count", 0)
+        new_undo_count = new_snap.get("undo_action_count", 0)
+
+        if new_label_count != old_label_count:
+            last_label = new_snap.get("last_label_action")
+            if last_label and new_label_count > old_label_count:
+                diff["label_changes"].append({
+                    "type": "label",
+                    "operation": last_label.get("operation"),
+                    "event_id_short": last_label.get("event_id_short"),
+                    "old_status": last_label.get("old_status"),
+                    "new_status": last_label.get("new_status"),
+                    "acted_at": last_label.get("acted_at"),
+                })
+                diff["summary"].append(f"新标注: {last_label.get('operation')} -> {last_label.get('new_status')}")
+
+        if new_undo_count != old_undo_count:
+            last_undo = new_snap.get("last_undo_action")
+            if last_undo and new_undo_count > old_undo_count:
+                diff["label_changes"].append({
+                    "type": "undo",
+                    "undo_type_desc": last_undo.get("undo_type_desc"),
+                    "acted_at": last_undo.get("acted_at"),
+                })
+                diff["summary"].append(f"撤销操作: {last_undo.get('undo_type_desc')}")
+
+        return diff
+
+    def get_change_summary(self, batch_id: str, compare_with: str = "previous") -> Dict:
+        current = self.load_overview_snapshot(batch_id, auto_refresh=False)
+        if not current:
+            return {"error": "no_current_snapshot"}
+
+        if compare_with == "previous":
+            snapshots = self.list_historical_snapshots(batch_id, limit=2)
+            if len(snapshots) < 1:
+                return {
+                    "current": current,
+                    "previous": None,
+                    "diff": None,
+                    "note": "没有历史快照可供对比，当前为初始状态",
+                }
+            prev_id = snapshots[0]["snapshot_id"]
+            previous = self.load_historical_snapshot(batch_id, prev_id)
+        elif compare_with == "first":
+            all_snaps = self.list_historical_snapshots(batch_id, limit=1000)
+            if not all_snaps:
+                return {
+                    "current": current,
+                    "previous": None,
+                    "diff": None,
+                    "note": "没有历史快照",
+                }
+            first_id = all_snaps[-1]["snapshot_id"]
+            previous = self.load_historical_snapshot(batch_id, first_id)
+        else:
+            previous = self.load_historical_snapshot(batch_id, compare_with)
+
+        if not previous:
+            return {
+                "current": current,
+                "previous": None,
+                "diff": None,
+                "note": f"找不到快照: {compare_with}",
+            }
+
+        diff = self._compare_snapshots(previous, current)
+        return {
+            "current": current,
+            "previous": previous,
+            "diff": diff,
+            "note": f"对比快照 {previous.get('snapshot_id')} (触发: {previous.get('trigger', 'unknown')})",
+        }
+
+    def _read_change_log(self, batch_id: str) -> List[Dict]:
+        path = self._change_log_path(batch_id)
+        if not path.exists():
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return []
+
+    def _write_change_log(self, batch_id: str, log: List[Dict]) -> None:
+        self._ensure_batch_dir(batch_id)
+        with open(self._change_log_path(batch_id), "w", encoding="utf-8") as f:
+            json.dump(log, f, ensure_ascii=False, indent=2)
+
+    def log_change(self, batch_id: str, change_type: str, detail: Dict, severity: str = "info") -> None:
+        log = self._read_change_log(batch_id)
+        entry = {
+            "id": str(uuid.uuid4())[:8],
+            "change_type": change_type,
+            "detail": detail,
+            "severity": severity,
+            "created_at": datetime.now().isoformat(),
+        }
+        log.append(entry)
+        if len(log) > 500:
+            log = log[-500:]
+        self._write_change_log(batch_id, log)
+
+    def get_change_log(self, batch_id: str, limit: int = 50, change_type: str = None) -> List[Dict]:
+        log = self._read_change_log(batch_id)
+        if change_type:
+            log = [e for e in log if e.get("change_type") == change_type]
+        return log[-limit:][::-1]
+
+    def _update_snapshot_consistency_marker(self, batch_id: str, snapshot: Dict) -> None:
+        try:
+            marker = {
+                "event_count": snapshot.get("event_count", 0),
+                "imported_file_count": snapshot.get("imported_file_count", 0),
+                "parse_error_count": snapshot.get("parse_error_count", 0),
+                "label_action_count": snapshot.get("label_action_count", 0),
+                "export_count": snapshot.get("export_count", 0),
+                "rule_version": snapshot.get("rule_version", ""),
+                "dedup_window_seconds": snapshot.get("dedup_window_seconds", 0),
+                "gap_threshold_seconds": snapshot.get("gap_threshold_seconds", 0),
+                "updated_at": datetime.now().isoformat(),
+            }
+            with open(self._snapshot_consistency_marker_path(batch_id), "w", encoding="utf-8") as f:
+                json.dump(marker, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    def check_snapshot_consistency(self, batch_id: str) -> Dict:
+        result = {
+            "consistent": True,
+            "inconsistencies": [],
+            "current_snapshot": None,
+            "real_data": None,
+        }
+
+        try:
+            snapshot = self.load_overview_snapshot(batch_id, auto_refresh=False)
+            result["current_snapshot"] = snapshot
+
+            real_events = len(self.load_events(batch_id))
+            real_imports = len(self.get_imported_files(batch_id))
+            real_errors = len(self.load_parse_errors(batch_id))
+            real_config = self.load_config(batch_id)
+            real_exports = len(self.get_exports(batch_id))
+            real_history = len(self.get_label_history(batch_id))
+
+            result["real_data"] = {
+                "event_count": real_events,
+                "imported_file_count": real_imports,
+                "parse_error_count": real_errors,
+                "label_action_count": real_history,
+                "export_count": real_exports,
+                "rule_version": real_config.rule_version,
+                "dedup_window_seconds": real_config.dedup_window_seconds,
+                "gap_threshold_seconds": real_config.gap_threshold_seconds,
+            }
+
+            snap_events = snapshot.get("event_count", 0)
+            if snap_events != real_events:
+                result["consistent"] = False
+                result["inconsistencies"].append({
+                    "field": "event_count",
+                    "snapshot": snap_events,
+                    "real": real_events,
+                    "diff": real_events - snap_events,
+                })
+
+            snap_imports = snapshot.get("imported_file_count", 0)
+            if snap_imports != real_imports:
+                result["consistent"] = False
+                result["inconsistencies"].append({
+                    "field": "imported_file_count",
+                    "snapshot": snap_imports,
+                    "real": real_imports,
+                    "diff": real_imports - snap_imports,
+                })
+
+            snap_errors = snapshot.get("parse_error_count", 0)
+            if snap_errors != real_errors:
+                result["consistent"] = False
+                result["inconsistencies"].append({
+                    "field": "parse_error_count",
+                    "snapshot": snap_errors,
+                    "real": real_errors,
+                    "diff": real_errors - snap_errors,
+                })
+
+            snap_version = snapshot.get("rule_version", "")
+            if snap_version != real_config.rule_version:
+                result["consistent"] = False
+                result["inconsistencies"].append({
+                    "field": "rule_version",
+                    "snapshot": snap_version,
+                    "real": real_config.rule_version,
+                })
+
+            snap_dedup = snapshot.get("dedup_window_seconds", 0)
+            if snap_dedup != real_config.dedup_window_seconds:
+                result["consistent"] = False
+                result["inconsistencies"].append({
+                    "field": "dedup_window_seconds",
+                    "snapshot": snap_dedup,
+                    "real": real_config.dedup_window_seconds,
+                })
+
+            snap_gap = snapshot.get("gap_threshold_seconds", 0)
+            if snap_gap != real_config.gap_threshold_seconds:
+                result["consistent"] = False
+                result["inconsistencies"].append({
+                    "field": "gap_threshold_seconds",
+                    "snapshot": snap_gap,
+                    "real": real_config.gap_threshold_seconds,
+                })
+
+            snap_exports = snapshot.get("export_count", 0)
+            if snap_exports != real_exports:
+                result["consistent"] = False
+                result["inconsistencies"].append({
+                    "field": "export_count",
+                    "snapshot": snap_exports,
+                    "real": real_exports,
+                    "diff": real_exports - snap_exports,
+                })
+
+            snap_history = snapshot.get("label_action_count", 0)
+            if snap_history != real_history:
+                result["consistent"] = False
+                result["inconsistencies"].append({
+                    "field": "label_action_count",
+                    "snapshot": snap_history,
+                    "real": real_history,
+                    "diff": real_history - snap_history,
+                })
+
+        except Exception as e:
+            result["consistent"] = False
+            result["error"] = str(e)
+
+        return result
+
+    def check_duplicate_import(self, batch_id: str, file_path: str, file_hash: str = None) -> Dict:
+        result = {
+            "is_duplicate": False,
+            "existing_entry": None,
+            "hash_changed": False,
+            "recommendation": "import",
+        }
+
+        abs_path = str(Path(file_path).resolve())
+        filename = os.path.basename(file_path)
+
+        imported = self.get_imported_files(batch_id)
+        for entry in imported:
+            if entry.get("abs_path") == abs_path or entry.get("filename") == filename:
+                result["is_duplicate"] = True
+                result["existing_entry"] = {
+                    "filename": entry.get("filename"),
+                    "abs_path": entry.get("abs_path"),
+                    "file_hash": entry.get("file_hash", "")[:16],
+                    "event_count": entry.get("event_count", 0),
+                    "error_count": entry.get("error_count", 0),
+                    "imported_at": entry.get("imported_at"),
+                }
+                if file_hash:
+                    existing_hash = entry.get("file_hash", "")
+                    if existing_hash and existing_hash != file_hash:
+                        result["hash_changed"] = True
+                        result["recommendation"] = "force_reimport"
+                    else:
+                        result["recommendation"] = "skip"
+                else:
+                    result["recommendation"] = "check_hash"
+                break
+
+        return result
+
+    def get_export_comparison(self, batch_id: str) -> Dict:
+        exports = self.get_exports(batch_id)
+        if not exports:
+            return {"exports": [], "comparison": None}
+
+        result = {
+            "exports": exports[:10],
+            "comparison": None,
+        }
+
+        if len(exports) >= 2:
+            latest = exports[0]
+            previous = exports[1]
+            size_diff = latest.get("size", 0) - previous.get("size", 0)
+            result["comparison"] = {
+                "latest": latest,
+                "previous": previous,
+                "size_diff": size_diff,
+                "size_diff_percent": round((size_diff / previous.get("size", 1)) * 100, 1) if previous.get("size", 0) > 0 else 0,
+                "time_diff_seconds": None,
+            }
+            try:
+                from datetime import datetime as dt
+                latest_dt = dt.fromisoformat(latest.get("modified_at", ""))
+                prev_dt = dt.fromisoformat(previous.get("modified_at", ""))
+                result["comparison"]["time_diff_seconds"] = int((latest_dt - prev_dt).total_seconds())
+            except Exception:
+                pass
+
+        return result
+
+    def refresh_overview_snapshot(self, batch_id: str, trigger: str = "manual") -> Dict:
+        old_snapshot = None
+        snapshot_path = self._overview_snapshot_path(batch_id)
+        if snapshot_path.exists():
+            try:
+                with open(snapshot_path, "r", encoding="utf-8") as f:
+                    old_snapshot = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                pass
+
         snapshot = {
             "snapshot_version": 1,
             "updated_at": datetime.now().isoformat(),
@@ -716,48 +1245,99 @@ class StateStore:
         except Exception as e:
             snapshot["_write_error"] = str(e)
 
-        return snapshot
-
-    def load_overview_snapshot(self, batch_id: str, auto_refresh: bool = True) -> Dict:
-        path = self._overview_snapshot_path(batch_id)
-        if path.exists():
+        if old_snapshot:
+            has_changes = False
             try:
-                with open(path, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except (json.JSONDecodeError, IOError):
-                pass
-        if auto_refresh:
-            return self.refresh_overview_snapshot(batch_id)
-        return {}
+                key_fields = ["event_count", "imported_file_count", "parse_error_count",
+                              "export_count", "label_action_count", "undo_action_count",
+                              "rule_version", "dedup_window_seconds", "gap_threshold_seconds"]
+                for field in key_fields:
+                    if old_snapshot.get(field) != snapshot.get(field):
+                        has_changes = True
+                        break
+                if not has_changes:
+                    old_imports = {f.get("filename") for f in old_snapshot.get("imported_files", [])}
+                    new_imports = {f.get("filename") for f in snapshot.get("imported_files", [])}
+                    if old_imports != new_imports:
+                        has_changes = True
+            except Exception:
+                has_changes = True
 
-    def save_export(self, batch_id: str, export_type: str, content: str, filename: str) -> str:
-        batch_dir = self._ensure_batch_dir(batch_id)
-        exports_dir = batch_dir / "exports"
-        exports_dir.mkdir(exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        name, ext = os.path.splitext(filename)
-        export_filename = f"{name}_{ts}{ext}"
-        export_path = exports_dir / export_filename
-        with open(export_path, "w", encoding="utf-8") as f:
-            f.write(content)
+            if has_changes:
+                try:
+                    diff = self._compare_snapshots(old_snapshot, snapshot)
+                    change_type_map = {
+                        "import": "import_change",
+                        "undo_import": "import_change",
+                        "config": "config_change",
+                        "export": "export_change",
+                        "manual": "manual_refresh",
+                    }
+                    change_type = change_type_map.get(trigger, "other_change")
+                    self.log_change(batch_id, change_type, {
+                        "trigger": trigger,
+                        "diff_summary": diff.get("summary", []),
+                        "event_count_change": diff.get("event_count_change", 0),
+                        "status_changes": diff.get("status_changes", {}),
+                        "source_changes": diff.get("source_changes", {}),
+                        "config_changes": diff.get("config_changes", {}),
+                    }, severity="info")
+
+                    recent_history = self.list_historical_snapshots(batch_id, limit=1)
+                    should_save = True
+                    if recent_history:
+                        last_trigger = recent_history[0].get("trigger")
+                        last_saved_at = recent_history[0].get("saved_at", "")
+                        if last_trigger == trigger and last_saved_at:
+                            try:
+                                last_time = datetime.fromisoformat(last_saved_at)
+                                time_diff = (datetime.now() - last_time).total_seconds()
+                                if time_diff < 0.5:
+                                    should_save = False
+                            except (ValueError, TypeError):
+                                pass
+                    if should_save:
+                        self._save_historical_snapshot(batch_id, old_snapshot, trigger)
+                except Exception:
+                    pass
+
         try:
-            self.refresh_overview_snapshot(batch_id)
+            self._update_snapshot_consistency_marker(batch_id, snapshot)
         except Exception:
             pass
-        return str(export_path)
 
-    def get_exports(self, batch_id: str) -> List[Dict]:
-        batch_dir = self._get_batch_dir(batch_id)
-        exports_dir = batch_dir / "exports"
-        result = []
-        if exports_dir.exists():
-            for f in exports_dir.iterdir():
-                if f.is_file():
-                    result.append({
-                        "filename": f.name,
-                        "path": str(f),
-                        "size": f.stat().st_size,
-                        "modified_at": datetime.fromtimestamp(f.stat().st_mtime).isoformat(),
-                    })
-        result.sort(key=lambda x: x["modified_at"], reverse=True)
-        return result
+        return snapshot
+
+    def fix_snapshot_inconsistencies(self, batch_id: str) -> Dict:
+        check_result = self.check_snapshot_consistency(batch_id)
+        if check_result.get("consistent", True):
+            return {
+                "fixed": False,
+                "message": "快照一致，无需修复",
+                "check_result": check_result,
+            }
+
+        try:
+            inconsistencies = check_result.get("inconsistencies", [])
+            self.log_change(batch_id, "snapshot_repair", {
+                "inconsistencies_found": inconsistencies,
+                "action": "auto_refresh",
+            }, severity="warning")
+
+            new_snapshot = self.refresh_overview_snapshot(batch_id, trigger="repair")
+
+            verify_result = self.check_snapshot_consistency(batch_id)
+            return {
+                "fixed": verify_result.get("consistent", False),
+                "message": "已执行快照修复",
+                "inconsistencies_fixed": inconsistencies,
+                "new_snapshot": new_snapshot,
+                "verify_result": verify_result,
+            }
+        except Exception as e:
+            return {
+                "fixed": False,
+                "message": f"修复失败: {e}",
+                "error": str(e),
+                "check_result": check_result,
+            }
